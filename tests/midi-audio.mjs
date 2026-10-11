@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { startTestBrowser } from './helpers.mjs'
 
 const session = await startTestBrowser()
+const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
 try {
   const report = await session.page.evaluate(async () => {
     const { SynthEngine } = await import('/src/audio/SynthEngine.ts')
@@ -85,7 +86,7 @@ try {
       }
       const velocityRatios = Object.fromEntries([1, 32, 64, 127].map(value => [value, velocityRms[value] / velocityRms[127]]))
       check('Native audio responds linearly to MIDI velocity', { velocityRms, velocityRatios, velocityEnvelopes, legacyRms }, [
-        ['velocity 1 produces nonzero quiet sound', velocityRms[1] > 0.0002 && relativeNear(velocityRatios[1], 1 / 127)],
+        ['velocity 1 produces nonzero quiet sound with polyphonic headroom', velocityRms[1] > 0.00002 && relativeNear(velocityRatios[1], 1 / 127)],
         ['velocity 32 follows the 32/127 coefficient', relativeNear(velocityRatios[32], 32 / 127)],
         ['velocity 64 follows the 64/127 coefficient', relativeNear(velocityRatios[64], 64 / 127)],
         ['velocity 127 retains the original output level', relativeNear(velocityRms[127], legacyRms)],
@@ -127,7 +128,7 @@ try {
       const lowestCarrierFrequency = context.oscillators.at(-1).frequency.value
       check('Lowest MIDI note keeps its exact base frequency', { expected: lowestMidiFrequency, measured: lowestMeasured, carrierFrequency: lowestCarrierFrequency, signalRms: rms(engine) }, [
         ['MIDI zero is not clamped to the manual 20 Hz boundary', Math.abs(lowestCarrierFrequency - lowestMidiFrequency) < 0.00001],
-        ['native low-frequency cycles match MIDI zero', Math.abs(lowestMeasured - lowestMidiFrequency) < 0.02 && rms(engine) > 0.02],
+        ['native low-frequency cycles match MIDI zero', Math.abs(lowestMeasured - lowestMidiFrequency) < 0.02 && rms(engine) > 0.004],
       ])
       analysis.time.fftSize = 2048
 
@@ -224,7 +225,7 @@ try {
     }
   })
   await mkdir(new URL('../test-results/', import.meta.url), { recursive: true })
-  await writeFile(new URL('../test-results/midi-audio.json', import.meta.url), JSON.stringify(report, null, 2))
+  await writeFile(new URL(`../test-results/midi-audio-${browserName}.json`, import.meta.url), JSON.stringify({ browser: browserName, ...report }, null, 2))
   console.log(JSON.stringify(report, null, 2))
   assert.deepEqual(report.failures, [], 'MIDI native Web Audio tests failed')
   console.log(`PASS: ${report.results.length} MIDI audio scenarios, ${report.results.reduce((sum, result) => sum + result.checks.length, 0)} assertions`)

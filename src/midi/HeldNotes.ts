@@ -8,12 +8,12 @@ export interface HeldNote {
   origin: 'local' | 'midi'
 }
 
-/** Shared monophonic last-note priority, independent of React and audio nodes. */
+/** Physical held-key registry. Releasing a key never restarts another note. */
 export class HeldNotes {
   private notes = new Map<string, HeldNote>()
 
   get size() { return this.notes.size }
-  get active(): HeldNote | null { return [...this.notes.values()].at(-1) ?? null }
+  get values(): HeldNote[] { return [...this.notes.values()] }
 
   press(note: HeldNote): boolean {
     if (this.notes.has(note.id)) return false

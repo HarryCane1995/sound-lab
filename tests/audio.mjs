@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { startTestBrowser } from './helpers.mjs'
 
 const session = await startTestBrowser()
+const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
 try {
   const report = await session.page.evaluate(async () => {
     const { SynthEngine } = await import('/src/audio/SynthEngine.ts')
@@ -102,7 +103,7 @@ try {
         ['square suppresses the second harmonic', waves.square.secondRelativeDb < -40],
         ['sawtooth contains its second harmonic', waves.sawtooth.secondRelativeDb > -12],
         ['triangle third is weaker than square third', waves.triangle.thirdRelativeDb < waves.square.thirdRelativeDb - 6],
-        ['all four waveforms produce real audio', Object.values(waves).every(value => value.rms > 0.015)],
+        ['all four waveforms produce real audio with polyphonic headroom', Object.values(waves).every(value => value.rms > 0.003)],
       ])
 
       update({ waveform: 'sine', amplitude: 0.1 })
@@ -113,7 +114,7 @@ try {
       const referenceRms = rms()
       check('Amplitude changes actual RMS', { quietRms, louderRms: referenceRms, ratio: referenceRms / quietRms }, [
         ['3x amplitude yields approximately 3x RMS', referenceRms / quietRms > 2.75 && referenceRms / quietRms < 3.25],
-        ['safe initial output below 0.2 RMS', referenceRms > 0.07 && referenceRms < 0.2],
+        ['single voice retains measurable output with polyphonic headroom', referenceRms > 0.015 && referenceRms < 0.2],
       ])
 
       update({ waveform: 'sawtooth', amplitude: 0.18, filter: { cutoff: 500, q: 0.707, bypass: true } })
@@ -222,7 +223,7 @@ try {
         ['at most two carrier nodes alive', maxCarriers <= 2],
         ['retired node cleaned up', rapidDiagnostics.carrierCount === 1],
         ['final requested waveform applied', rapidDiagnostics.waveform === 'triangle' && rapidDiagnostics.pendingWaveform === null],
-        ['final triangle verified in audio', rapidThirdRelative < -15 && rapidThirdRelative > -25 && rms() > 0.015],
+        ['final triangle verified in audio', rapidThirdRelative < -15 && rapidThirdRelative > -25 && rms() > 0.003],
       ])
 
       // Only the resume promise is delayed: all nodes and analyser samples are
@@ -275,7 +276,7 @@ try {
     }
   })
   await mkdir(new URL('../test-results/', import.meta.url), { recursive: true })
-  await writeFile(new URL('../test-results/audio.json', import.meta.url), JSON.stringify(report, null, 2))
+  await writeFile(new URL(`../test-results/audio-${browserName}.json`, import.meta.url), JSON.stringify({ browser: browserName, ...report }, null, 2))
   console.log(JSON.stringify(report, null, 2))
   assert.deepEqual(report.failures, [], 'Real Web Audio regression tests failed')
   console.log(`PASS: ${report.results.length} audio scenarios, ${report.results.reduce((sum, result) => sum + result.checks.length, 0)} assertions`)

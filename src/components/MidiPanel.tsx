@@ -8,7 +8,7 @@ import { Hint } from './Controls'
 interface MidiPanelProps {
   state: MidiState
   velocity: number | null
-  activeNote: { midi: number; frequency: number; sourceName: string; channel: number } | null
+  activeNotes: { id: string; midi: number; frequency: number; sourceName: string; channel: number }[]
   pitchBend: number
   modulation: number
   bendRange: number
@@ -47,7 +47,7 @@ function eventDetail(event: MidiMessage) {
   return 'Системное сообщение'
 }
 
-export function MidiPanel({ state, velocity, activeNote, pitchBend, modulation, bendRange, onBendRange, onConnect, onSelectInput, onLearn, onCancelLearn, onResolveConflict, onRemoveBinding, onBindingMode, onClearBindings, onClearMonitor, onPanic }: MidiPanelProps) {
+export function MidiPanel({ state, velocity, activeNotes, pitchBend, modulation, bendRange, onBendRange, onConnect, onSelectInput, onLearn, onCancelLearn, onResolveConflict, onRemoveBinding, onBindingMode, onClearBindings, onClearMonitor, onPanic }: MidiPanelProps) {
   const [target, setTarget] = useState<MidiTargetId>('filter.cutoff')
   const activity = useMidiActivity(state.lastActivity, 260)
   const semitones = pitchBend
@@ -76,12 +76,12 @@ export function MidiPanel({ state, velocity, activeNote, pitchBend, modulation, 
       <div className="midi-meters" aria-label="Входящие MIDI-значения">
         <div className={`midi-meter midi-activity${activity ? ' has-activity' : ''}`}><span>Вход <i aria-hidden="true" /></span><output aria-label="MIDI-активность">{activity ? 'Сигнал' : 'Ожидание'}</output></div>
         <div className="midi-meter"><span>Velocity <Hint text="Сила нажатия от 1 до 127: влияет на громкость ноты вместе с Amplitude и ADSR. Ноль отпускает ноту." /></span><output aria-label="Текущая Velocity">{velocity === null ? '—' : velocity}<small> / 127</small></output><div className="midi-level" aria-hidden="true"><span style={{ width: `${(velocity ?? 0) / 127 * 100}%` }} /></div></div>
-        <div className="midi-meter"><span>Pitch Bend <Hint text="Отклонение высоты текущей ноты, в полутонах. Центральное положение возвращает исходную высоту." /></span><output aria-label="Текущий Pitch Bend">{semitones > 0 ? '+' : ''}{semitones.toFixed(2)}<small> st</small></output><label className="midi-bend-range">± <select aria-label="Диапазон Pitch Bend" value={bendRange} onChange={event => onBendRange(Number(event.target.value))}><option value={2}>2 st</option><option value={12}>12 st</option></select></label></div>
+        <div className="midi-meter"><span>Pitch Bend <Hint text="Последнее отклонение высоты, в полутонах. Изменяет все голоса того же MIDI-источника и канала, включая Release. Центральное положение возвращает исходную высоту." /></span><output aria-label="Текущий Pitch Bend">{semitones > 0 ? '+' : ''}{semitones.toFixed(2)}<small> st</small></output><label className="midi-bend-range">± <select aria-label="Диапазон Pitch Bend" value={bendRange} onChange={event => onBendRange(Number(event.target.value))}><option value={2}>2 st</option><option value={12}>12 st</option></select></label></div>
         <div className="midi-meter"><span>Modulation <Hint text="Стандартный CC1 меняет глубину LFO. Другой CC можно назначить кнопкой M у LFO Depth." /></span><output aria-label="Текущая Modulation">{modulation}<small> / 127 · {modPercent}%</small></output><div className="midi-level" aria-hidden="true"><span style={{ width: `${modPercent}%` }} /></div></div>
       </div>
     </div>
     <div className="midi-note" aria-live="off">
-      {activeNote ? <><span className="midi-note-name">{midiName(activeNote.midi)}</span><span>MIDI {activeNote.midi}</span><span>{activeNote.frequency.toFixed(2)} Hz</span><span className="midi-note-source">{activeNote.sourceName} · канал {activeNote.channel}</span></> : <span>Сыграйте ноту на MIDI-клавиатуре — здесь появятся её имя, номер и частота.</span>}
+      {activeNotes.length ? <ul className="midi-note-list" aria-label="Удерживаемые MIDI-ноты">{activeNotes.map(note => <li key={note.id}><span className="midi-note-name">{midiName(note.midi)}</span><span>MIDI {note.midi}</span><span>{note.frequency.toFixed(2)} Hz</span><span className="midi-note-source">{note.sourceName} · канал {note.channel}</span></li>)}</ul> : <span>Сыграйте аккорд на MIDI-клавиатуре — здесь появятся имена, номера и частоты удерживаемых нот.</span>}
     </div>
     {state.learning && <div className="midi-learning-notice" role="status"><span><b>MIDI Learn: {targetLabel(state.learning)}</b> · {TARGETS.find(item => item.id === state.learning)?.kind === 'action' ? 'Нажмите пэд или кнопку (Note On / CC).' : 'Поверните ручку, которая отправляет CC.'} <kbd>Esc</kbd> — отмена.</span><button type="button" onClick={onCancelLearn}>Отменить MIDI Learn</button></div>}
     {state.conflict && <div className="midi-conflict" role="alert"><div><b>Этот сигнал уже назначен</b><p>{sourceLabel(state.conflict.incoming)} · {state.conflict.incoming.sourceName}: «{targetLabel(state.conflict.existing.target)}». Заменить на «{targetLabel(state.conflict.incoming.target)}»?</p></div><div><button type="button" onClick={() => onResolveConflict(true)}>Заменить привязку</button><button type="button" onClick={() => onResolveConflict(false)}>Отменить замену</button></div></div>}

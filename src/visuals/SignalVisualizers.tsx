@@ -323,7 +323,7 @@ export function SignalVisualizers(props: SignalVisualizersProps) {
         <div className="panel-heading">
           <div>
             <p className="eyebrow">TIME DOMAIN</p>
-            <h2 id="scope-title">Осциллограмма <Hint text="Сигнал во времени (Time Domain). По горизонтали — миллисекунды, по вертикали — нормированная амплитуда AMP. Шкала увеличивает только график. LIVE означает измерение текущего сигнала." /></h2>
+            <h2 id="scope-title">Осциллограмма <Hint text="Общий сигнал всех голосов во времени (Time Domain). По горизонтали — миллисекунды, по вертикали — нормированная амплитуда AMP. Шкала увеличивает только график. LIVE означает измерение текущего сигнала." /></h2>
           </div>
           <div className="visual-tools">
             <select className="scope-scale" aria-label="Шкала амплитуды" title="Фиксированная шкала амплитуды: увеличивает график, не меняя звук. При выходе сигнала за шкалу выберите ×1." value={amplitudeLimit} onChange={event => setAmplitudeLimit(Number(event.target.value))}>
@@ -336,7 +336,7 @@ export function SignalVisualizers(props: SignalVisualizersProps) {
         </div>
         <canvas className="scope-canvas" ref={scopeRef} role="img" aria-label={`Осциллограмма реального выходного сигнала. По горизонтали время в миллисекундах, по вертикали амплитуда от −${amplitudeLimit} до ${amplitudeLimit}.`} />
         <div className="visual-caption">
-          <span>Шкала ±{amplitudeLimit} · после ADSR/фильтра</span>
+          <span>Шкала ±{amplitudeLimit} · все голоса / фильтр</span>
           <span ref={statusRef}>Тишина · −∞ dBFS</span>
         </div>
       </section>
@@ -344,7 +344,7 @@ export function SignalVisualizers(props: SignalVisualizersProps) {
         <div className="panel-heading">
           <div>
             <p className="eyebrow">FREQUENCY DOMAIN</p>
-            <h2 id="spectrum-title">Частотный спектр <Hint text="Частотный состав (Frequency Domain). FFT раскладывает сигнал на частоты, log означает логарифмическую шкалу. dBFS — децибелы относительно цифрового максимума: 0 dBFS — максимум, отрицательные значения — тише. Частота в Hz." /></h2>
+            <h2 id="spectrum-title">Частотный спектр <Hint text="Частотный состав общего сигнала всех голосов (Frequency Domain). FFT раскладывает сигнал на частоты, log означает логарифмическую шкалу. dBFS — децибелы относительно цифрового максимума: 0 dBFS — максимум, отрицательные значения — тише. Частота в Hz." /></h2>
           </div>
           <span className="tag">FFT · log</span>
         </div>

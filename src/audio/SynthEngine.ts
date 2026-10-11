@@ -1,32 +1,18 @@
 import { copyParams, type AnalysisNodes, type SynthParams, type Waveform } from '../types'
+import { SynthVoice } from './SynthVoice'
+import { MAX_RETIRING_VOICES, MAX_VOICES, VoiceManager, voiceMatches } from './VoiceManager'
+import type { VoiceNote, VoiceScope, VoiceSnapshot } from './voiceTypes'
 
-const SMOOTH_SECONDS = 0.025
-const MIN_ENVELOPE_SECONDS = 0.004
-const WAVE_FADE_SECONDS = 0.025
-// Keep the complete MIDI note range, including C-1; manual controls start at 20 Hz.
 const MIN_FREQUENCY = 440 * 2 ** ((0 - 69) / 12)
+const MIX_HEADROOM = 0.25
+const AUDITION_ID = 'audition'
 
-type EnvelopePhase = 'attack' | 'decay' | 'sustain' | 'release' | 'idle'
-interface Ramp {
-  start: number
-  end: number
-  from: number
-  to: number
-}
-interface EnvelopeRamp extends Ramp { phase: EnvelopePhase }
-interface Carrier {
-  oscillator: OscillatorNode
-  gain: GainNode
-  waveform: Waveform
-}
 interface Graph {
   input: GainNode
   filter: BiquadFilterNode
   dry: GainNode
   wet: GainNode
-  envelope: GainNode
   amplitude: GainNode
-  velocityGain: GainNode
   compressor: DynamicsCompressorNode
   master: GainNode
   limiter: WaveShaperNode
@@ -36,6 +22,7 @@ interface Graph {
   pitchModulation: GainNode
   filterModulation: GainNode
 }
+interface NoteRequest { token: number; note: VoiceNote }
 
 function bounded(value: number, min: number, max: number, fallback: number): number {
   return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback
@@ -56,147 +43,200 @@ function sanitized(params: SynthParams): SynthParams {
   return copy
 }
 
-function rampValue(ramp: Ramp, now: number): number {
-  if (now <= ramp.start) return ramp.from
-  if (now >= ramp.end) return ramp.to
-  return ramp.from + (ramp.to - ramp.from) * ((now - ramp.start) / (ramp.end - ramp.start))
-}
+function bendKey(sourceId: string, channel: number): string { return JSON.stringify([sourceId, channel]) }
 
 /**
- * One monophonic voice. AudioContext is created by noteOn() or a user-gesture
- * prepare(), so constructing the engine or moving controls stays audio-free.
- * Carrier replacement uses a 25 ms crossfade, with at most two carriers alive.
+ * Sixteen independent notes share one lazy context, filter, pitch/filter LFO and
+ * protected output. Release counts toward the limit; stealing has bounded fades.
  */
 export class SynthEngine {
   private params: SynthParams
   private context: AudioContext | null = null
   private graph: Graph | null = null
-  private carrier: Carrier | null = null
-  private retiringCarrier: Carrier | null = null
-  private waveformFadeEnds = 0
-  private waveformTimer: ReturnType<typeof setTimeout> | null = null
-  private frequencyRamp: Ramp
-  private envelopeRamps: EnvelopeRamp[] = []
-  private gateOpen = false
-  private releaseEnds = 0
-  private requestVersion = 0
+  private voices = new VoiceManager()
+  // Intents survive voice stealing until the corresponding physical Note Off.
+  private intents = new Map<string, NoteRequest>()
+  private pending = new Map<string, NoteRequest>()
+  private sourceBends = new Map<string, { sourceId: string; channel: number; value: number }>()
+  private requestToken = 0
+  private instanceId = 0
+  private maintenanceTimer: ReturnType<typeof setTimeout> | null = null
+  private capacityTimer: ReturnType<typeof setTimeout> | null = null
+  private capacityWait: Promise<void> | null = null
+  private capacityResolve: (() => void) | null = null
   private disposed = false
   private resumePromise: Promise<void> | null = null
   private disposePromise: Promise<void> | null = null
-  private velocity = 127
-  private pitchBend = 0
+  private auditionPitchBend = 0
+  private lastVelocity = 127
 
-  constructor(initial: SynthParams) {
-    this.params = sanitized(initial)
-    this.frequencyRamp = { start: 0, end: 0, from: this.params.frequency, to: this.params.frequency }
-  }
+  constructor(initial: SynthParams) { this.params = sanitized(initial) }
 
-  /** Applies controls before or after initialization, without opening the gate. */
+  /** Controls stay audio-free; only an audition follows global Frequency. */
   setParams(params: SynthParams): void {
     if (this.disposed) return
-    const previous = this.params
     this.params = sanitized(params)
-    const context = this.context
-    const graph = this.graph
-    if (!context || !graph || context.state === 'closed') return
-    const now = context.currentTime
-
-    if (previous.frequency !== this.params.frequency) {
-      const current = rampValue(this.frequencyRamp, now)
-      this.frequencyRamp = { start: now, end: now + SMOOTH_SECONDS, from: current, to: this.params.frequency }
-      for (const carrier of this.carriers()) {
-        carrier.oscillator.frequency.cancelScheduledValues(now)
-        carrier.oscillator.frequency.setValueAtTime(current, now)
-        carrier.oscillator.frequency.linearRampToValueAtTime(this.params.frequency, now + SMOOTH_SECONDS)
-      }
+    for (const request of this.pending.values()) {
+      if (request.note.origin === 'audition') request.note.frequency = this.params.frequency
     }
+    if (!this.context || !this.graph || this.context.state === 'closed') return
+    const now = this.context.currentTime
+    const graph = this.graph
+    this.maintain(now)
     this.smooth(graph.amplitude.gain, this.params.amplitude, now)
-    this.smooth(graph.filter.frequency, Math.min(this.params.filter.cutoff, context.sampleRate * 0.49), now)
-    // Web Audio low-pass Q is expressed in dB; the interface uses the familiar
-    // unitless quality factor (0.707 gives a flat Butterworth response).
+    this.smooth(graph.filter.frequency, Math.min(this.params.filter.cutoff, this.context.sampleRate * 0.49), now)
+    // The UI uses a unitless Q; Web Audio low-pass Q is specified in dB.
     this.smooth(graph.filter.Q, 20 * Math.log10(this.params.filter.q), now)
     this.smooth(graph.dry.gain, this.params.filter.bypass ? 1 : 0, now)
     this.smooth(graph.wet.gain, this.params.filter.bypass ? 0 : 1, now)
     this.smooth(graph.lfo.frequency, this.params.lfo.rate, now)
-
-    // Modulate in cents, keeping pitch positive and filter movement proportional
-    // across the complete cutoff range. Both destinations fade during a switch.
     const depth = this.params.lfo.enabled ? this.params.lfo.depth : 0
     this.smooth(graph.pitchModulation.gain, this.params.lfo.target === 'pitch' ? depth * 100 : 0, now)
     this.smooth(graph.filterModulation.gain, this.params.lfo.target === 'filter' ? depth * 2400 : 0, now)
-
-    const adsrChanged = (Object.keys(this.params.adsr) as Array<keyof SynthParams['adsr']>)
-      .some(key => previous.adsr[key] !== this.params.adsr[key])
-    if (adsrChanged) this.updateEnvelope(previous, now)
-    this.requestWaveform(now)
+    for (const voice of this.voices.all) voice.setParams(this.params, now)
+    this.scheduleMaintenance()
   }
 
-  /** Unlocks audio from a connection gesture without opening the note gate. */
+  /** Unlock from a gesture without allocating or playing a voice. */
   async prepare(): Promise<void> {
     if (this.disposed) return
     if (!this.context) this.initialize()
-    try {
-      await this.resumeContext(this.context!)
-    } catch (error) {
-      if (!this.disposed) throw error
-    }
+    try { await this.resumeContext(this.context!) }
+    catch (error) { if (!this.disposed) throw error }
   }
 
-  /** A later Note Off always cancels a pending resume, including MIDI input. */
+  /** Legacy manual Play API. Its audition is isolated from all keyboard notes. */
   async noteOn(frequency?: number, velocity = 127): Promise<void> {
     if (this.disposed) return
     const nextVelocity = bounded(velocity, 0, 127, 127)
-    if (nextVelocity === 0) {
-      this.noteOff()
+    if (nextVelocity === 0) { this.noteOff(); return }
+    if (frequency !== undefined) this.setParams({ ...this.params, frequency })
+    const existing = this.voices.findHeld(AUDITION_ID)
+    if (existing && this.context) {
+      existing.retrigger(nextVelocity, this.context.currentTime)
+      this.lastVelocity = nextVelocity
+      this.scheduleMaintenance()
       return
     }
-    const version = ++this.requestVersion
-    if (frequency !== undefined) this.setParams({ ...this.params, frequency })
-    if (!this.context) this.initialize()
-    const context = this.context!
-    if (context.state === 'closed') return
-
-    if (context.state !== 'running') {
-      try {
-        await this.resumeContext(context)
-      } catch (error) {
-        if (!this.disposed && version === this.requestVersion) throw error
-        return
-      }
-    }
-    if (this.disposed || version !== this.requestVersion || context.state !== 'running') return
-    const now = context.currentTime
-    this.velocity = nextVelocity
-    this.smooth(this.graph!.velocityGain.gain, nextVelocity / 127, now)
-    this.requestWaveform(now)
-    this.gateOpen = true
-    this.releaseEnds = 0
-    this.attack(now)
+    // Play can restart an audition stolen by a full chord; physical duplicates
+    // still use noteOnVoice and retain their stolen-key tombstones.
+    if (!this.pending.has(AUDITION_ID)) this.intents.delete(AUDITION_ID)
+    await this.noteOnVoice({
+      id: AUDITION_ID, midi: null, frequency: this.params.frequency,
+      velocity: nextVelocity, sourceId: 'audition', sourceName: 'Play',
+      channel: null, origin: 'audition',
+    })
   }
 
-  /** Adds a continuous cents offset to the oscillator and the pitch LFO. */
+  noteOff(): void { this.noteOffVoice(AUDITION_ID) }
+
+  async noteOnVoice(note: VoiceNote): Promise<void> {
+    if (this.disposed) return
+    const velocity = bounded(note.velocity, 0, 127, 127)
+    if (velocity === 0) { this.noteOffVoice(note.id); return }
+    if (this.intents.has(note.id)) return
+    const request: NoteRequest = {
+      token: ++this.requestToken,
+      note: { ...note, velocity, frequency: bounded(note.frequency, MIN_FREQUENCY, 20000, this.params.frequency) },
+    }
+    this.intents.set(note.id, request)
+    this.pending.set(note.id, request)
+    try {
+      if (!this.context) this.initialize()
+      const context = this.context!
+      // Only saturated stealing bursts wait. Reservation and node creation stay
+      // in the same synchronous turn, so concurrent starts cannot overbook slots.
+      while (true) {
+        if (this.disposed || this.intents.get(note.id) !== request || this.pending.get(note.id) !== request) return
+        if (context.state === 'closed') {
+          this.intents.delete(note.id)
+          return
+        }
+        if (context.state !== 'running') {
+          await this.resumeContext(context)
+          continue
+        }
+        this.maintain(context.currentTime)
+        if (this.voices.makeRoom()) break
+        await this.waitForCapacity()
+      }
+      if (request.note.origin === 'audition') request.note.frequency = this.params.frequency
+      const pitchBend = request.note.origin === 'audition' ? this.auditionPitchBend
+        : request.note.origin === 'midi' && request.note.channel !== null
+          ? this.sourceBends.get(bendKey(request.note.sourceId, request.note.channel))?.value ?? 0 : 0
+      const voice = new SynthVoice(context, this.graph!.input, this.graph!.pitchModulation,
+        request.note, this.params, ++this.instanceId, pitchBend)
+      this.voices.add(voice)
+      this.lastVelocity = velocity
+      this.scheduleMaintenance()
+    } catch (error) {
+      if (!this.disposed && this.intents.get(note.id) === request) {
+        this.intents.delete(note.id)
+        throw error
+      }
+    } finally {
+      if (this.pending.get(note.id) === request) this.pending.delete(note.id)
+    }
+  }
+
+  /** A specific Note Off cannot release another source, channel or stolen key. */
+  noteOffVoice(id: string, immediate = false): void {
+    if (this.disposed) return
+    this.intents.delete(id)
+    this.pending.delete(id)
+    this.voices.release(id, immediate)
+    this.wakeCapacity()
+    this.scheduleMaintenance()
+  }
+
+  releaseVoices(scope: VoiceScope, immediate = false): void {
+    if (this.disposed) return
+    for (const [id, request] of this.intents) {
+      if (!voiceMatches(request.note, scope)) continue
+      this.intents.delete(id)
+      this.pending.delete(id)
+    }
+    this.voices.releaseScope(scope, immediate)
+    this.wakeCapacity()
+    this.scheduleMaintenance()
+  }
+
+  /** Manual audition bend; incoming MIDI uses setSourcePitchBend instead. */
   setPitchBend(semitones: number): void {
     if (this.disposed) return
-    this.pitchBend = bounded(semitones, -24, 24, 0)
+    this.auditionPitchBend = bounded(semitones, -24, 24, 0)
     if (!this.context || this.context.state === 'closed') return
     const now = this.context.currentTime
-    for (const carrier of this.carriers()) this.smooth(carrier.oscillator.detune, this.pitchBend * 100, now)
+    for (const voice of this.voices.all) {
+      if (voice.note.origin === 'audition') voice.setPitchBend(this.auditionPitchBend, now)
+    }
   }
 
-  /** Release starts at the current envelope value, including during attack. */
-  noteOff(): void {
+  /** Includes Release tails and future notes, while leaving other sources alone. */
+  setSourcePitchBend(sourceId: string, channel: number, semitones: number): void {
     if (this.disposed) return
-    ++this.requestVersion
-    this.gateOpen = false
-    this.release(this.params.adsr.release)
+    const value = bounded(semitones, -24, 24, 0)
+    const key = bendKey(sourceId, channel)
+    if (value === 0) this.sourceBends.delete(key)
+    else this.sourceBends.set(key, { sourceId, channel, value })
+    if (!this.context || this.context.state === 'closed') return
+    const now = this.context.currentTime
+    for (const voice of this.voices.all) {
+      if (voice.note.origin === 'midi' && voice.note.sourceId === sourceId && voice.note.channel === channel) voice.setPitchBend(value, now)
+    }
   }
 
-  /** Short click-free release used for blur, hidden documents and pointer loss. */
+  /** Cancels pending starts and smoothly shortens every held/releasing voice. */
   panic(): void {
     if (this.disposed) return
-    ++this.requestVersion
-    this.gateOpen = false
-    this.release(0.025)
+    this.intents.clear()
+    this.pending.clear()
+    this.sourceBends.clear()
+    this.auditionPitchBend = 0
+    if (this.context) for (const voice of this.voices.all) voice.setPitchBend(0, this.context.currentTime)
+    this.voices.releaseScope({}, true)
+    this.wakeCapacity()
+    this.scheduleMaintenance()
   }
 
   getAnalysis(): AnalysisNodes | null {
@@ -204,56 +244,72 @@ export class SynthEngine {
     return { time: this.graph.time, frequency: this.graph.frequency, sampleRate: this.context.sampleRate }
   }
 
-  getState(): { contextState: string; gateOpen: boolean; audible: boolean } {
+  /** Includes short retiring tails; filter by retiring for the 16-slot allocator. */
+  getVoices(): VoiceSnapshot[] {
+    const now = this.context?.currentTime ?? 0
+    return this.voices.all.map(voice => voice.getSnapshot(now))
+  }
+
+  getState(): {
+    contextState: string; gateOpen: boolean; audible: boolean;
+    voiceCount: number; heldCount: number; pendingCount: number; auditionGateOpen: boolean;
+  } {
     const context = this.context
+    const snapshots = this.getVoices()
     return {
       contextState: this.disposed ? 'closed' : context?.state ?? 'not-created',
-      gateOpen: this.gateOpen,
-      audible: !this.disposed && context?.state === 'running' && (this.gateOpen || context.currentTime < this.releaseEnds),
+      gateOpen: snapshots.some(voice => voice.gateOpen),
+      audible: !this.disposed && context?.state === 'running' && snapshots.some(voice => voice.phase !== 'idle'),
+      voiceCount: this.voices.count,
+      heldCount: this.voices.heldCount,
+      pendingCount: this.pending.size,
+      auditionGateOpen: snapshots.some(voice => voice.origin === 'audition' && voice.gateOpen),
     }
   }
 
-  /** Read-only instrumentation for audio regression tests; no graph mutation. */
-  getDiagnostics(): { carrierCount: number; envelope: number; phase: EnvelopePhase; waveform: Waveform; pendingWaveform: Waveform | null; disposed: boolean; velocity: number; velocityGain: number; pitchBend: number } {
-    const now = this.context?.currentTime ?? 0
-    const waveform = this.carrier?.waveform ?? this.params.waveform
+  /** Read-only instrumentation, retaining the audition's legacy scalar fields. */
+  getDiagnostics() {
+    const snapshots = this.getVoices()
+    const latest = [...snapshots].reverse().find(voice => voice.origin === 'audition') ?? snapshots.at(-1)
+    const latestVoice = this.voices.all.find(voice => voice.instanceId === latest?.instanceId)
+    const waveform: Waveform = latestVoice?.getWaveform() ?? this.params.waveform
+    const totalCarrierCount = snapshots.reduce((sum, voice) => sum + voice.carrierCount, 0)
+    const velocity = latest?.velocity ?? this.lastVelocity
     return {
-      carrierCount: this.carriers().length,
-      envelope: this.envelopeValue(now),
-      phase: this.envelopePhase(now),
-      waveform,
-      pendingWaveform: waveform !== this.params.waveform ? this.params.waveform : null,
-      disposed: this.disposed,
-      velocity: this.velocity,
-      velocityGain: this.velocity / 127,
-      pitchBend: this.pitchBend,
+      carrierCount: totalCarrierCount, totalCarrierCount,
+      envelope: latest?.envelope ?? 0,
+      phase: latest?.phase ?? 'idle',
+      waveform, pendingWaveform: waveform !== this.params.waveform ? this.params.waveform : null,
+      disposed: this.disposed, velocity, velocityGain: velocity / 127,
+      pitchBend: latest?.pitchBend ?? this.auditionPitchBend,
+      voices: snapshots, voiceCount: this.voices.count, managedCount: this.voices.count,
+      retiringCount: this.voices.retiringCount, pendingCount: this.pending.size,
+      maxVoices: MAX_VOICES, maxRetiringVoices: MAX_RETIRING_VOICES,
+      mixHeadroom: MIX_HEADROOM,
+      createdVoiceCount: this.voices.createdCount, destroyedVoiceCount: this.voices.destroyedCount,
     }
   }
 
-  /** Idempotent teardown, including cancellation of Note On and crossfade tasks. */
   async dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
     this.disposed = true
-    ++this.requestVersion
-    this.gateOpen = false
-    this.clearWaveformTimer()
+    this.intents.clear()
+    this.pending.clear()
+    this.sourceBends.clear()
+    this.clearMaintenance()
+    this.wakeCapacity()
     const context = this.context
     if (!context) return
-    this.release(0.015)
+    this.voices.releaseScope({}, true)
     this.disposePromise = (async () => {
-      // Allow the scheduled fade to reach the output before closing the context.
-      if (context.state === 'running') await new Promise<void>(resolve => setTimeout(resolve, 25))
+      if (context.state === 'running') await new Promise<void>(resolve => setTimeout(resolve, 30))
       context.removeEventListener('statechange', this.onContextStateChange)
-      for (const carrier of this.carriers()) this.destroyCarrier(carrier)
-      this.carrier = null
-      this.retiringCarrier = null
+      this.voices.destroyAll()
       if (this.graph) {
-        try { this.graph.lfo.stop() } catch { /* Context can already be closed. */ }
+        try { this.graph.lfo.stop() } catch { /* May already be closed. */ }
         for (const node of Object.values(this.graph)) node.disconnect()
       }
       this.graph = null
-      this.envelopeRamps = []
-      this.releaseEnds = 0
       if (context.state !== 'closed') await context.close()
       this.context = null
     })()
@@ -261,47 +317,32 @@ export class SynthEngine {
   }
 
   private initialize(): void {
-    // A high-rate Windows device may default to 192 kHz. Request 48 kHz for a
-    // modest synthesis/visualization cost; Chrome resamples to the output device.
     const context = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' })
     this.context = context
     const graph: Graph = {
-      input: context.createGain(),
-      filter: context.createBiquadFilter(),
-      dry: context.createGain(),
-      wet: context.createGain(),
-      envelope: context.createGain(),
-      amplitude: context.createGain(),
-      velocityGain: context.createGain(),
-      compressor: context.createDynamicsCompressor(),
-      master: context.createGain(),
-      limiter: context.createWaveShaper(),
-      time: context.createAnalyser(),
-      frequency: context.createAnalyser(),
-      lfo: context.createOscillator(),
-      pitchModulation: context.createGain(),
-      filterModulation: context.createGain(),
+      input: context.createGain(), filter: context.createBiquadFilter(),
+      dry: context.createGain(), wet: context.createGain(), amplitude: context.createGain(),
+      compressor: context.createDynamicsCompressor(), master: context.createGain(),
+      limiter: context.createWaveShaper(), time: context.createAnalyser(), frequency: context.createAnalyser(),
+      lfo: context.createOscillator(), pitchModulation: context.createGain(), filterModulation: context.createGain(),
     }
     this.graph = graph
-    const now = context.currentTime
     const params = this.params
+    // Fixed headroom avoids pumping the remaining chord when one note is added
+    // or removed; the compressor and limiter handle exceptional resonant peaks.
+    graph.input.gain.value = MIX_HEADROOM
     graph.filter.type = 'lowpass'
     graph.filter.frequency.value = Math.min(params.filter.cutoff, context.sampleRate * 0.49)
     graph.filter.Q.value = 20 * Math.log10(params.filter.q)
     graph.dry.gain.value = params.filter.bypass ? 1 : 0
     graph.wet.gain.value = params.filter.bypass ? 0 : 1
-    graph.envelope.gain.value = 0
     graph.amplitude.gain.value = params.amplitude
-    graph.velocityGain.gain.value = this.velocity / 127
     graph.master.gain.value = 0.55
     graph.compressor.threshold.value = -6
     graph.compressor.knee.value = 6
     graph.compressor.ratio.value = 20
     graph.compressor.attack.value = 0.003
     graph.compressor.release.value = 0.15
-
-    // Identity in the normal range; smoothly bounds exceptional resonant peaks.
-    // Thus a quiet sine remains a sine instead of acquiring limiter harmonics.
     const curve = new Float32Array(4097)
     for (let i = 0; i < curve.length; i++) {
       const x = i * 2 / (curve.length - 1) - 1
@@ -310,8 +351,6 @@ export class SynthEngine {
     }
     graph.limiter.curve = curve
     graph.limiter.oversample = '2x'
-    // At 48 kHz, 16384 samples cover several periods even at 20 Hz and provide
-    // 2.93 Hz FFT bins. Adapt if a browser/device chooses another sample rate.
     const analysisFftSize = Math.min(32768, 2 ** Math.ceil(Math.log2(context.sampleRate / 20 * 4)))
     graph.time.fftSize = analysisFftSize
     graph.time.smoothingTimeConstant = 0
@@ -324,15 +363,12 @@ export class SynthEngine {
     const depth = params.lfo.enabled ? params.lfo.depth : 0
     graph.pitchModulation.gain.value = params.lfo.target === 'pitch' ? depth * 100 : 0
     graph.filterModulation.gain.value = params.lfo.target === 'filter' ? depth * 2400 : 0
-
     graph.input.connect(graph.dry)
     graph.input.connect(graph.filter)
     graph.filter.connect(graph.wet)
-    graph.dry.connect(graph.envelope)
-    graph.wet.connect(graph.envelope)
-    graph.envelope.connect(graph.amplitude)
-    graph.amplitude.connect(graph.velocityGain)
-    graph.velocityGain.connect(graph.compressor)
+    graph.dry.connect(graph.amplitude)
+    graph.wet.connect(graph.amplitude)
+    graph.amplitude.connect(graph.compressor)
     graph.compressor.connect(graph.master)
     graph.master.connect(graph.limiter)
     graph.limiter.connect(graph.time)
@@ -341,86 +377,11 @@ export class SynthEngine {
     graph.lfo.connect(graph.pitchModulation)
     graph.lfo.connect(graph.filterModulation)
     graph.filterModulation.connect(graph.filter.detune)
-    this.frequencyRamp = { start: now, end: now, from: params.frequency, to: params.frequency }
-    this.carrier = this.createCarrier(params.waveform, 1, now)
-    graph.lfo.start(now)
+    graph.lfo.start()
     context.addEventListener('statechange', this.onContextStateChange)
   }
 
-  private createCarrier(waveform: Waveform, gain: number, now: number): Carrier {
-    const context = this.context!
-    const graph = this.graph!
-    const carrier: Carrier = { oscillator: context.createOscillator(), gain: context.createGain(), waveform }
-    carrier.oscillator.type = waveform
-    carrier.oscillator.frequency.setValueAtTime(rampValue(this.frequencyRamp, now), now)
-    carrier.oscillator.detune.setValueAtTime(this.pitchBend * 100, now)
-    if (this.frequencyRamp.end > now) carrier.oscillator.frequency.linearRampToValueAtTime(this.frequencyRamp.to, this.frequencyRamp.end)
-    carrier.gain.gain.setValueAtTime(gain, now)
-    graph.pitchModulation.connect(carrier.oscillator.detune)
-    carrier.oscillator.connect(carrier.gain)
-    carrier.gain.connect(graph.input)
-    carrier.oscillator.start(now)
-    return carrier
-  }
-
-  private requestWaveform(now: number): void {
-    if (!this.carrier || !this.context || this.disposed) return
-    if (this.retiringCarrier) {
-      if (now < this.waveformFadeEnds) {
-        this.scheduleWaveformCleanup()
-        return // Coalesce fast input to the newest requested waveform.
-      }
-      this.destroyCarrier(this.retiringCarrier)
-      this.retiringCarrier = null
-      this.clearWaveformTimer()
-    }
-    if (this.carrier.waveform === this.params.waveform) return
-    const outgoing = this.carrier
-    const incoming = this.createCarrier(this.params.waveform, 0, now)
-    incoming.gain.gain.linearRampToValueAtTime(1, now + WAVE_FADE_SECONDS)
-    outgoing.gain.gain.cancelScheduledValues(now)
-    outgoing.gain.gain.setValueAtTime(1, now)
-    outgoing.gain.gain.linearRampToValueAtTime(0, now + WAVE_FADE_SECONDS)
-    outgoing.oscillator.stop(now + WAVE_FADE_SECONDS + 0.005)
-    this.retiringCarrier = outgoing
-    this.carrier = incoming
-    this.waveformFadeEnds = now + WAVE_FADE_SECONDS + 0.005
-    this.scheduleWaveformCleanup()
-  }
-
-  private scheduleWaveformCleanup(): void {
-    if (this.waveformTimer !== null || !this.retiringCarrier || this.context?.state !== 'running' || this.disposed) return
-    const remaining = Math.max(1, (this.waveformFadeEnds - this.context.currentTime) * 1000 + 2)
-    this.waveformTimer = setTimeout(() => {
-      this.waveformTimer = null
-      if (this.context?.state === 'running' && !this.disposed) this.requestWaveform(this.context.currentTime)
-    }, remaining)
-  }
-
-  private clearWaveformTimer(): void {
-    if (this.waveformTimer !== null) clearTimeout(this.waveformTimer)
-    this.waveformTimer = null
-  }
-
-  private readonly onContextStateChange = (): void => {
-    if (this.context?.state === 'running') this.scheduleWaveformCleanup()
-    else this.clearWaveformTimer()
-  }
-
-  private carriers(): Carrier[] {
-    return [this.carrier, this.retiringCarrier].filter((carrier): carrier is Carrier => carrier !== null)
-  }
-
-  private destroyCarrier(carrier: Carrier): void {
-    try { carrier.oscillator.stop() } catch { /* Already stopped or closed. */ }
-    try { this.graph?.pitchModulation.disconnect(carrier.oscillator.detune) } catch { /* Connection already removed. */ }
-    carrier.oscillator.disconnect()
-    carrier.gain.disconnect()
-  }
-
   private smooth(param: AudioParam, value: number, now: number): void {
-    // Target ramps have no future endpoints to remove. Canceling a preceding
-    // target preserves its value at now, then the next target starts smoothly.
     param.cancelAndHoldAtTime(now)
     param.setTargetAtTime(value, now, 0.008)
   }
@@ -429,90 +390,61 @@ export class SynthEngine {
     if (context.state === 'running' || context.state === 'closed') return
     const resume = this.resumePromise ?? context.resume()
     this.resumePromise = resume
-    try {
-      await resume
-    } finally {
-      if (this.resumePromise === resume) this.resumePromise = null
-    }
+    try { await resume }
+    finally { if (this.resumePromise === resume) this.resumePromise = null }
   }
 
-  private envelopeValue(now: number): number {
-    if (this.envelopeRamps.length === 0) return 0
-    for (const ramp of this.envelopeRamps) {
-      if (now <= ramp.end) return rampValue(ramp, now)
-    }
-    return this.envelopeRamps[this.envelopeRamps.length - 1].to
+  private maintain(now: number): void {
+    const before = this.voices.count + this.voices.retiringCount
+    this.voices.maintain(now)
+    if (before > this.voices.count + this.voices.retiringCount) this.wakeCapacity()
   }
 
-  private envelopePhase(now: number): EnvelopePhase {
-    for (const ramp of this.envelopeRamps) {
-      if (now < ramp.end) return ramp.phase
-    }
-    return this.gateOpen ? 'sustain' : 'idle'
+  /** All queued starts share one short timer, with no extra audio nodes. */
+  private waitForCapacity(): Promise<void> {
+    if (this.disposed) return Promise.resolve()
+    if (this.capacityWait) return this.capacityWait
+    this.capacityWait = new Promise<void>(resolve => { this.capacityResolve = resolve })
+    const at = this.voices.nextMaintenanceAt()
+    const wait = this.context?.state === 'running' && Number.isFinite(at)
+      ? Math.max(1, Math.min(20, (at - this.context.currentTime) * 1000 + 2)) : 20
+    this.capacityTimer = setTimeout(() => this.wakeCapacity(), wait)
+    return this.capacityWait
   }
 
-  private holdEnvelope(now: number): number {
-    const value = this.envelopeValue(now)
-    const param = this.graph!.envelope.gain
-    // A modeled fallback is useful for browsers without cancelAndHoldAtTime;
-    // Chrome/Edge use the native hold, including an interrupted linear ramp.
-    if (typeof param.cancelAndHoldAtTime === 'function') param.cancelAndHoldAtTime(now)
-    else {
-      param.cancelScheduledValues(now)
-      param.setValueAtTime(value, now)
-    }
-    return value
+  private wakeCapacity(): void {
+    if (this.capacityTimer !== null) clearTimeout(this.capacityTimer)
+    this.capacityTimer = null
+    const resolve = this.capacityResolve
+    this.capacityWait = null
+    this.capacityResolve = null
+    resolve?.()
   }
 
-  private scheduleEnvelope(ramps: EnvelopeRamp[], now: number): void {
-    this.holdEnvelope(now)
-    const param = this.graph!.envelope.gain
-    for (const ramp of ramps) param.linearRampToValueAtTime(ramp.to, ramp.end)
-    this.envelopeRamps = ramps
+  private scheduleMaintenance(): void {
+    this.clearMaintenance()
+    if (this.disposed || this.context?.state !== 'running') return
+    const at = this.voices.nextMaintenanceAt()
+    if (!Number.isFinite(at)) return
+    const wait = Math.max(1, (at - this.context.currentTime) * 1000 + 2)
+    this.maintenanceTimer = setTimeout(() => {
+      this.maintenanceTimer = null
+      if (this.disposed || this.context?.state !== 'running') return
+      this.maintain(this.context.currentTime)
+      this.scheduleMaintenance()
+      this.wakeCapacity()
+    }, wait)
   }
 
-  private attack(now: number): void {
-    const value = this.envelopeValue(now)
-    const attackEnd = now + Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.attack)
-    const decayEnd = attackEnd + Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.decay)
-    this.scheduleEnvelope([
-      { start: now, end: attackEnd, from: value, to: 1, phase: 'attack' },
-      { start: attackEnd, end: decayEnd, from: 1, to: this.params.adsr.sustain, phase: 'decay' },
-    ], now)
+  private clearMaintenance(): void {
+    if (this.maintenanceTimer !== null) clearTimeout(this.maintenanceTimer)
+    this.maintenanceTimer = null
   }
 
-  private release(seconds: number): void {
-    if (!this.context || !this.graph || this.context.state === 'closed') return
-    const now = this.context.currentTime
-    const value = this.envelopeValue(now)
-    this.releaseEnds = value > 0 ? now + Math.max(MIN_ENVELOPE_SECONDS, seconds) : now
-    this.scheduleEnvelope([
-      { start: now, end: now + Math.max(MIN_ENVELOPE_SECONDS, seconds), from: value, to: 0, phase: 'release' },
-    ], now)
-  }
-
-  private updateEnvelope(previous: SynthParams, now: number): void {
-    const value = this.envelopeValue(now)
-    const phase = this.envelopePhase(now)
-    const current = this.envelopeRamps.find(ramp => now < ramp.end)
-    if (this.gateOpen) {
-      if (phase === 'attack' && current) {
-        const remaining = (current.end - now) * Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.attack) / Math.max(MIN_ENVELOPE_SECONDS, previous.adsr.attack)
-        const attackEnd = now + Math.max(MIN_ENVELOPE_SECONDS, remaining)
-        this.scheduleEnvelope([
-          { start: now, end: attackEnd, from: value, to: 1, phase: 'attack' },
-          { start: attackEnd, end: attackEnd + Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.decay), from: 1, to: this.params.adsr.sustain, phase: 'decay' },
-        ], now)
-      } else if (phase === 'decay' && current) {
-        const remaining = (current.end - now) * Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.decay) / Math.max(MIN_ENVELOPE_SECONDS, previous.adsr.decay)
-        this.scheduleEnvelope([{ start: now, end: now + Math.max(MIN_ENVELOPE_SECONDS, remaining), from: value, to: this.params.adsr.sustain, phase: 'decay' }], now)
-      } else {
-        this.scheduleEnvelope([{ start: now, end: now + SMOOTH_SECONDS, from: value, to: this.params.adsr.sustain, phase: 'sustain' }], now)
-      }
-    } else if (phase === 'release' && current && previous.adsr.release !== this.params.adsr.release) {
-      const remaining = (current.end - now) * Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.release) / Math.max(MIN_ENVELOPE_SECONDS, previous.adsr.release)
-      this.releaseEnds = now + Math.max(MIN_ENVELOPE_SECONDS, remaining)
-      this.scheduleEnvelope([{ start: now, end: this.releaseEnds, from: value, to: 0, phase: 'release' }], now)
-    }
+  private readonly onContextStateChange = (): void => {
+    if (this.context?.state === 'running') {
+      this.maintain(this.context.currentTime)
+      this.scheduleMaintenance()
+    } else this.clearMaintenance()
   }
 }
