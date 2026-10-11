@@ -1,4 +1,6 @@
 import { useId, useRef, useState } from 'react'
+import type { MidiTargetId } from '../midi/types'
+import { MidiLearnButton } from '../midi/MidiLearnContext'
 
 export function Hint({ text }: { text: string }) {
   return <span className="hint" tabIndex={0} role="note" aria-label={text}>
@@ -20,9 +22,10 @@ interface ParameterProps {
   disabled?: boolean
   precision?: number
   endpoints?: [string, string]
+  midiTarget?: MidiTargetId
 }
 
-export function Parameter({ name, term, hint, value, min, max, step = 0.01, unit, onChange, logarithmic = false, disabled = false, precision = 2, endpoints }: ParameterProps) {
+export function Parameter({ name, term, hint, value, min, max, step = 0.01, unit, onChange, logarithmic = false, disabled = false, precision = 2, endpoints, midiTarget }: ParameterProps) {
   const id = useId()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -35,6 +38,7 @@ export function Parameter({ name, term, hint, value, min, max, step = 0.01, unit
   return <div className={`parameter ${disabled ? 'parameter-disabled' : ''}`}>
     <div className="parameter-heading">
       <label htmlFor={id}>{name} <span className="term">{term}</span></label>
+      {midiTarget && <MidiLearnButton target={midiTarget} />}
       <Hint text={hint} />
     </div>
     <div className="parameter-value">
@@ -76,10 +80,10 @@ export function Parameter({ name, term, hint, value, min, max, step = 0.01, unit
   </div>
 }
 
-export function Toggle({ checked, onChange, label, hint }: { checked: boolean; onChange: (value: boolean) => void; label: string; hint?: string }) {
+export function Toggle({ checked, onChange, label, hint, midiTarget }: { checked: boolean; onChange: (value: boolean) => void; label: string; hint?: string; midiTarget?: MidiTargetId }) {
   return <div className="toggle-container"><button type="button" className="toggle" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}>
     <span className="toggle-track"><span /></span><span>{label}</span>
-  </button>{hint && <Hint text={hint} />}</div>
+  </button>{midiTarget && <MidiLearnButton target={midiTarget} />}{hint && <Hint text={hint} />}</div>
 }
 
 export function WaveIcon({ waveform }: { waveform: string }) {

@@ -3,6 +3,8 @@ import { copyParams, type AnalysisNodes, type SynthParams, type Waveform } from 
 const SMOOTH_SECONDS = 0.025
 const MIN_ENVELOPE_SECONDS = 0.004
 const WAVE_FADE_SECONDS = 0.025
+// Keep the complete MIDI note range, including C-1; manual controls start at 20 Hz.
+const MIN_FREQUENCY = 440 * 2 ** ((0 - 69) / 12)
 
 type EnvelopePhase = 'attack' | 'decay' | 'sustain' | 'release' | 'idle'
 interface Ramp {
@@ -24,6 +26,7 @@ interface Graph {
   wet: GainNode
   envelope: GainNode
   amplitude: GainNode
+  velocityGain: GainNode
   compressor: DynamicsCompressorNode
   master: GainNode
   limiter: WaveShaperNode
@@ -40,7 +43,7 @@ function bounded(value: number, min: number, max: number, fallback: number): num
 
 function sanitized(params: SynthParams): SynthParams {
   const copy = copyParams(params)
-  copy.frequency = bounded(copy.frequency, 20, 20000, 220)
+  copy.frequency = bounded(copy.frequency, MIN_FREQUENCY, 20000, 220)
   copy.amplitude = bounded(copy.amplitude, 0, 1, 0.25)
   copy.adsr.attack = bounded(copy.adsr.attack, 0, 20, 0.02)
   copy.adsr.decay = bounded(copy.adsr.decay, 0, 20, 0.2)
@@ -60,8 +63,8 @@ function rampValue(ramp: Ramp, now: number): number {
 }
 
 /**
- * One monophonic voice. AudioContext is created exclusively by noteOn(), so
- * constructing the engine or moving controls never starts the audio system.
+ * One monophonic voice. AudioContext is created by noteOn() or a user-gesture
+ * prepare(), so constructing the engine or moving controls stays audio-free.
  * Carrier replacement uses a 25 ms crossfade, with at most two carriers alive.
  */
 export class SynthEngine {
@@ -80,6 +83,8 @@ export class SynthEngine {
   private disposed = false
   private resumePromise: Promise<void> | null = null
   private disposePromise: Promise<void> | null = null
+  private velocity = 127
+  private pitchBend = 0
 
   constructor(initial: SynthParams) {
     this.params = sanitized(initial)
@@ -126,9 +131,25 @@ export class SynthEngine {
     this.requestWaveform(now)
   }
 
-  /** User-gesture entry point. A later Note Off always cancels a pending resume. */
-  async noteOn(frequency?: number): Promise<void> {
+  /** Unlocks audio from a connection gesture without opening the note gate. */
+  async prepare(): Promise<void> {
     if (this.disposed) return
+    if (!this.context) this.initialize()
+    try {
+      await this.resumeContext(this.context!)
+    } catch (error) {
+      if (!this.disposed) throw error
+    }
+  }
+
+  /** A later Note Off always cancels a pending resume, including MIDI input. */
+  async noteOn(frequency?: number, velocity = 127): Promise<void> {
+    if (this.disposed) return
+    const nextVelocity = bounded(velocity, 0, 127, 127)
+    if (nextVelocity === 0) {
+      this.noteOff()
+      return
+    }
     const version = ++this.requestVersion
     if (frequency !== undefined) this.setParams({ ...this.params, frequency })
     if (!this.context) this.initialize()
@@ -136,23 +157,30 @@ export class SynthEngine {
     if (context.state === 'closed') return
 
     if (context.state !== 'running') {
-      const resume = this.resumePromise ?? context.resume()
-      this.resumePromise = resume
       try {
-        await resume
+        await this.resumeContext(context)
       } catch (error) {
         if (!this.disposed && version === this.requestVersion) throw error
         return
-      } finally {
-        if (this.resumePromise === resume) this.resumePromise = null
       }
     }
     if (this.disposed || version !== this.requestVersion || context.state !== 'running') return
     const now = context.currentTime
+    this.velocity = nextVelocity
+    this.smooth(this.graph!.velocityGain.gain, nextVelocity / 127, now)
     this.requestWaveform(now)
     this.gateOpen = true
     this.releaseEnds = 0
     this.attack(now)
+  }
+
+  /** Adds a continuous cents offset to the oscillator and the pitch LFO. */
+  setPitchBend(semitones: number): void {
+    if (this.disposed) return
+    this.pitchBend = bounded(semitones, -24, 24, 0)
+    if (!this.context || this.context.state === 'closed') return
+    const now = this.context.currentTime
+    for (const carrier of this.carriers()) this.smooth(carrier.oscillator.detune, this.pitchBend * 100, now)
   }
 
   /** Release starts at the current envelope value, including during attack. */
@@ -186,7 +214,7 @@ export class SynthEngine {
   }
 
   /** Read-only instrumentation for audio regression tests; no graph mutation. */
-  getDiagnostics(): { carrierCount: number; envelope: number; phase: EnvelopePhase; waveform: Waveform; pendingWaveform: Waveform | null; disposed: boolean } {
+  getDiagnostics(): { carrierCount: number; envelope: number; phase: EnvelopePhase; waveform: Waveform; pendingWaveform: Waveform | null; disposed: boolean; velocity: number; velocityGain: number; pitchBend: number } {
     const now = this.context?.currentTime ?? 0
     const waveform = this.carrier?.waveform ?? this.params.waveform
     return {
@@ -196,6 +224,9 @@ export class SynthEngine {
       waveform,
       pendingWaveform: waveform !== this.params.waveform ? this.params.waveform : null,
       disposed: this.disposed,
+      velocity: this.velocity,
+      velocityGain: this.velocity / 127,
+      pitchBend: this.pitchBend,
     }
   }
 
@@ -241,6 +272,7 @@ export class SynthEngine {
       wet: context.createGain(),
       envelope: context.createGain(),
       amplitude: context.createGain(),
+      velocityGain: context.createGain(),
       compressor: context.createDynamicsCompressor(),
       master: context.createGain(),
       limiter: context.createWaveShaper(),
@@ -260,6 +292,7 @@ export class SynthEngine {
     graph.wet.gain.value = params.filter.bypass ? 0 : 1
     graph.envelope.gain.value = 0
     graph.amplitude.gain.value = params.amplitude
+    graph.velocityGain.gain.value = this.velocity / 127
     graph.master.gain.value = 0.55
     graph.compressor.threshold.value = -6
     graph.compressor.knee.value = 6
@@ -298,7 +331,8 @@ export class SynthEngine {
     graph.dry.connect(graph.envelope)
     graph.wet.connect(graph.envelope)
     graph.envelope.connect(graph.amplitude)
-    graph.amplitude.connect(graph.compressor)
+    graph.amplitude.connect(graph.velocityGain)
+    graph.velocityGain.connect(graph.compressor)
     graph.compressor.connect(graph.master)
     graph.master.connect(graph.limiter)
     graph.limiter.connect(graph.time)
@@ -319,6 +353,7 @@ export class SynthEngine {
     const carrier: Carrier = { oscillator: context.createOscillator(), gain: context.createGain(), waveform }
     carrier.oscillator.type = waveform
     carrier.oscillator.frequency.setValueAtTime(rampValue(this.frequencyRamp, now), now)
+    carrier.oscillator.detune.setValueAtTime(this.pitchBend * 100, now)
     if (this.frequencyRamp.end > now) carrier.oscillator.frequency.linearRampToValueAtTime(this.frequencyRamp.to, this.frequencyRamp.end)
     carrier.gain.gain.setValueAtTime(gain, now)
     graph.pitchModulation.connect(carrier.oscillator.detune)
@@ -388,6 +423,17 @@ export class SynthEngine {
     // target preserves its value at now, then the next target starts smoothly.
     param.cancelAndHoldAtTime(now)
     param.setTargetAtTime(value, now, 0.008)
+  }
+
+  private async resumeContext(context: AudioContext): Promise<void> {
+    if (context.state === 'running' || context.state === 'closed') return
+    const resume = this.resumePromise ?? context.resume()
+    this.resumePromise = resume
+    try {
+      await resume
+    } finally {
+      if (this.resumePromise === resume) this.resumePromise = null
+    }
   }
 
   private envelopeValue(now: number): number {
