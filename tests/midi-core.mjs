@@ -60,7 +60,8 @@ try {
         ['all continuous targets roundtrip0/1 and clamp bounds', bounds.every(([target, low, high]) => Math.abs(value(setTargetNormalized(DEFAULT_PARAMS, target, -1), target) - low) < 1e-8 && Math.abs(value(setTargetNormalized(DEFAULT_PARAMS, target, 2), target) - high) < 1e-8 && Math.abs(getTargetNormalized(setTargetNormalized(DEFAULT_PARAMS, target, .371), target) - .371) < 1e-8)],
         ['frequency midpoint uses geometric mean', Math.abs(setTargetNormalized(DEFAULT_PARAMS, 'frequency', .5).frequency - Math.sqrt(20 * 20000)) < 1e-8],
         ['waveform CC spans all4 waveforms', [0, 32, 64, 96, 127].map(number => setTargetNormalized(DEFAULT_PARAMS, 'waveform', number / 127).waveform).join() === 'sine,square,sawtooth,triangle,triangle'],
-        ['all26 targets are unique and include actions', TARGETS.length === 26 && new Set(TARGETS.map(target => target.id)).size === 26 && TARGETS.find(target => target.id === 'filter.bypass').kind === 'action'],
+        ['all27 targets are unique and include existing actions plus synthesis mode', TARGETS.length === 27 && new Set(TARGETS.map(target => target.id)).size === 27 && TARGETS.find(target => target.id === 'filter.bypass').kind === 'action' && TARGETS.find(target => target.id === 'synthesis.mode').kind === 'action'],
+        ['Classic waveform CC selects Classic without losing harmonics', (() => { const additive = { ...DEFAULT_PARAMS, mode: 'additive', additive: { ...DEFAULT_PARAMS.additive, levels: Array(16).fill(42) } }; const classic = setTargetNormalized(additive, 'waveform', 1); return classic.mode === 'classic' && classic.waveform === 'triangle' && classic.additive.levels.every(level => level === 42) })()],
       ])
       const first = new Input('a'), second = new Input('b', 'Second Controller')
       const access = new Access([first, second])

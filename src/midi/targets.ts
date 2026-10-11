@@ -6,6 +6,7 @@ export const TARGETS: MidiTarget[] = [
   { id: 'frequency', label: 'Frequency · Частота', kind: 'continuous' },
   { id: 'amplitude', label: 'Amplitude · Громкость', kind: 'continuous' },
   { id: 'waveform', label: 'Waveform · Форма волны', kind: 'discrete' },
+  { id: 'synthesis.mode', label: 'Classic / Additive · Режим синтеза', kind: 'action' },
   { id: 'adsr.attack', label: 'Attack · Атака', kind: 'continuous' },
   { id: 'adsr.decay', label: 'Decay · Спад', kind: 'continuous' },
   { id: 'adsr.sustain', label: 'Sustain · Удержание', kind: 'continuous' },
@@ -68,7 +69,7 @@ export function getTargetNormalized(params: SynthParams, target: MidiTargetId): 
 export function setTargetNormalized(params: SynthParams, target: MidiTargetId, normalized: number): SynthParams {
   const next = copyParams(params)
   const position = clampNormalized(normalized)
-  if (target === 'waveform') { next.waveform = waves[Math.min(3, Math.floor(position * 4))]; return next }
+  if (target === 'waveform') { next.waveform = waves[Math.min(3, Math.floor(position * 4))]; next.mode = 'classic'; next.additive.compare = false; return next }
   const range = ranges[target]
   if (!range) return next
   const value = range.log ? range.min * (range.max / range.min) ** position : range.min + (range.max - range.min) * position

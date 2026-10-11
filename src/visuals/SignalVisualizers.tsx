@@ -336,7 +336,7 @@ export function SignalVisualizers(props: SignalVisualizersProps) {
         </div>
         <canvas className="scope-canvas" ref={scopeRef} role="img" aria-label={`Осциллограмма реального выходного сигнала. По горизонтали время в миллисекундах, по вертикали амплитуда от −${amplitudeLimit} до ${amplitudeLimit}.`} />
         <div className="visual-caption">
-          <span>Шкала ±{amplitudeLimit} · все голоса / фильтр</span>
+          <span>Реальный выход · все голоса / ADSR / фильтр</span>
           <span ref={statusRef}>Тишина · −∞ dBFS</span>
         </div>
       </section>

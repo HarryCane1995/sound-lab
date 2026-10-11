@@ -1,4 +1,6 @@
-import { copyParams, type SynthParams, type Waveform } from '../types'
+import { copyParams, type SynthMode, type SynthParams, type Waveform } from '../types'
+import { getClassicComparisonGain, getHarmonicCoefficients } from '../harmonics/model'
+import { getPeriodicWaveCache, harmonicKey, type PeriodicWaveCache } from './PeriodicWaveCache'
 import type { EnvelopePhase, VoiceNote, VoiceSnapshot } from './voiceTypes'
 
 const MIN_ENVELOPE_SECONDS = 0.004
@@ -7,7 +9,8 @@ const SMOOTH_SECONDS = 0.025
 
 interface Ramp { start: number; end: number; from: number; to: number }
 interface EnvelopeRamp extends Ramp { phase: EnvelopePhase }
-interface Carrier { oscillator: OscillatorNode; gain: GainNode; waveform: Waveform }
+interface Timbre { mode: SynthMode; waveform: Waveform; key: string; level: number; coefficients: number[] | null }
+interface Carrier { oscillator: OscillatorNode; gain: GainNode; waveform: Waveform; mode: SynthMode; key: string; level: number }
 
 function rampValue(ramp: Ramp, now: number): number {
   if (now <= ramp.start) return ramp.from
@@ -42,6 +45,7 @@ export class SynthVoice {
   private destroyed = false
   private context: AudioContext
   private pitchModulation: GainNode
+  private waveCache: PeriodicWaveCache
 
   constructor(
     context: AudioContext,
@@ -54,6 +58,7 @@ export class SynthVoice {
   ) {
     this.context = context
     this.pitchModulation = pitchModulation
+    this.waveCache = getPeriodicWaveCache(context)
     this.note = { ...note }
     this.params = copyParams(params)
     this.instanceId = instanceId
@@ -67,7 +72,8 @@ export class SynthVoice {
     this.velocityGain.gain.value = note.velocity / 127
     this.envelope.connect(this.velocityGain)
     this.velocityGain.connect(destination)
-    this.carrier = this.createCarrier(params.waveform, 1, now)
+    const timbre = this.getTimbre()
+    this.carrier = this.createCarrier(timbre, timbre.level, now)
     this.attack(now)
   }
 
@@ -141,7 +147,16 @@ export class SynthVoice {
     }
   }
 
-  getWaveform(): Waveform { return this.carrier?.waveform ?? this.params.waveform }
+  getWaveform(): Waveform {
+    return this.carrier?.mode === 'classic' ? this.carrier.waveform : this.params.waveform
+  }
+
+  getMode(): SynthMode { return this.carrier?.mode ?? this.params.mode }
+
+  hasPendingTimbre(): boolean {
+    const timbre = this.getTimbre()
+    return this.carrier?.key !== timbre.key || this.carrier.level !== timbre.level
+  }
 
   destroy(): void {
     if (this.destroyed) return
@@ -165,9 +180,25 @@ export class SynthVoice {
     }
   }
 
-  private createCarrier(waveform: Waveform, gain: number, now: number): Carrier {
-    const carrier: Carrier = { oscillator: this.context.createOscillator(), gain: this.context.createGain(), waveform }
-    carrier.oscillator.type = waveform
+  private getTimbre(): Timbre {
+    const mode = this.params.mode
+    const waveform = this.params.waveform
+    const coefficients = mode === 'additive' ? getHarmonicCoefficients(this.params.additive) : null
+    return {
+      mode, waveform, coefficients,
+      key: mode === 'additive' ? `additive:${harmonicKey(coefficients!)}` : `classic:${waveform}`,
+      level: mode === 'classic' && this.params.additive.compare
+        ? getClassicComparisonGain(this.params.additive, waveform) : 1,
+    }
+  }
+
+  private createCarrier(timbre: Timbre, gain: number, now: number): Carrier {
+    const carrier: Carrier = {
+      oscillator: this.context.createOscillator(), gain: this.context.createGain(),
+      waveform: timbre.waveform, mode: timbre.mode, key: timbre.key, level: timbre.level,
+    }
+    if (timbre.coefficients) carrier.oscillator.setPeriodicWave(this.waveCache.get(timbre.coefficients))
+    else carrier.oscillator.type = timbre.waveform
     carrier.oscillator.frequency.setValueAtTime(rampValue(this.frequencyRamp, now), now)
     if (this.frequencyRamp.end > now) carrier.oscillator.frequency.linearRampToValueAtTime(this.frequencyRamp.to, this.frequencyRamp.end)
     carrier.oscillator.detune.setValueAtTime(this.pitchBend * 100, now)
@@ -187,12 +218,18 @@ export class SynthVoice {
       this.retiringCarrier = null
       this.waveformFadeEnds = Infinity
     }
-    if (this.carrier.waveform === this.params.waveform) return
+    const timbre = this.getTimbre()
+    if (this.carrier.key === timbre.key) {
+      if (this.carrier.level !== timbre.level) {
+        smooth(this.carrier.gain.gain, timbre.level, now)
+        this.carrier.level = timbre.level
+      }
+      return
+    }
     const outgoing = this.carrier
-    const incoming = this.createCarrier(this.params.waveform, 0, now)
-    incoming.gain.gain.linearRampToValueAtTime(1, now + WAVE_FADE_SECONDS)
-    outgoing.gain.gain.cancelScheduledValues(now)
-    outgoing.gain.gain.setValueAtTime(1, now)
+    const incoming = this.createCarrier(timbre, 0, now)
+    incoming.gain.gain.linearRampToValueAtTime(timbre.level, now + WAVE_FADE_SECONDS)
+    outgoing.gain.gain.cancelAndHoldAtTime(now)
     outgoing.gain.gain.linearRampToValueAtTime(0, now + WAVE_FADE_SECONDS)
     outgoing.oscillator.stop(now + WAVE_FADE_SECONDS + 0.005)
     this.carrier = incoming

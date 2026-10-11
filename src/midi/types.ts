@@ -1,5 +1,5 @@
 export type MidiTargetId =
-  | 'frequency' | 'amplitude' | 'waveform'
+  | 'frequency' | 'amplitude' | 'waveform' | 'synthesis.mode'
   | 'adsr.attack' | 'adsr.decay' | 'adsr.sustain' | 'adsr.release'
   | 'filter.cutoff' | 'filter.q' | 'filter.bypass'
   | 'lfo.rate' | 'lfo.depth' | 'lfo.enabled' | 'lfo.target'

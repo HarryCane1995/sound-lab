@@ -2,13 +2,16 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { SynthEngine } from './audio/SynthEngine'
 import type { VoiceSnapshot } from './audio/voiceTypes'
 import { Hint, Parameter, SectionHeading, Toggle, WaveIcon } from './components/Controls'
-import { KEY_CODES, Piano, midiFrequency } from './components/Piano'
+import { KEY_CODES, Piano, midiFrequency, midiName } from './components/Piano'
+import { HarmonicBuilder } from './components/HarmonicBuilder'
 import { LessonPanel } from './components/LessonPanel'
 import { ENVELOPE_PRESETS, PRESETS } from './content/library'
+import { HARMONIC_TEMPLATES } from './content/harmonics'
+import { HARMONIC_PATCH_KEY, loadHarmonicState, saveHarmonicState } from './harmonics/storage'
 import { SignalVisualizers } from './visuals/SignalVisualizers'
 import { EnvelopeGraph } from './visuals/EnvelopeGraph'
-import { copyParams, DEFAULT_PARAMS } from './types'
-import type { Lesson, SynthParams, Waveform } from './types'
+import { copyAdditive, copyParams, defaultAdditive, DEFAULT_PARAMS } from './types'
+import type { AdditiveConfig, Lesson, SynthMode, SynthParams, Waveform } from './types'
 import { MidiController } from './midi/MidiController'
 import { HeldNotes, midiNoteId } from './midi/HeldNotes'
 import type { HeldNote } from './midi/HeldNotes'
@@ -29,7 +32,10 @@ const WAVES: { id: Waveform; name: string; english: string; hint: string }[] = [
 ]
 
 export default function App() {
-  const [params, setParams] = useState<SynthParams>(() => copyParams(DEFAULT_PARAMS))
+  const [initialHarmonics] = useState(() => loadHarmonicState())
+  const [params, setParams] = useState<SynthParams>(() => copyParams({ ...DEFAULT_PARAMS,
+    mode: initialHarmonics.state?.mode ?? 'classic', additive: initialHarmonics.state?.additive ?? DEFAULT_PARAMS.additive }))
+  const [patchStatus, setPatchStatus] = useState(initialHarmonics.error ?? 'Режим и гармоники сохраняются автоматически. Solo и Compare действуют только в этой сессии.')
   const paramsRef = useRef(params)
   const engineRef = useRef<SynthEngine | null>(null)
   const [audio, setAudio] = useState({ contextState: 'not-started', gateOpen: false, audible: false, auditionGateOpen: false, pendingCount: 0 })
@@ -95,6 +101,52 @@ export default function App() {
     if (custom) { setPresetId(''); setLoadedLesson(null) }
   }, [])
   const change = <K extends keyof SynthParams>(key: K, value: SynthParams[K]) => applyParams({ ...paramsRef.current, [key]: value })
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const error = saveHarmonicState(paramsRef.current)
+      if (error) setPatchStatus(error)
+    }, 150)
+    return () => window.clearTimeout(timer)
+  }, [params.mode, params.additive])
+
+  useEffect(() => {
+    const flush = () => { saveHarmonicState(paramsRef.current) }
+    window.addEventListener('pagehide', flush)
+    return () => window.removeEventListener('pagehide', flush)
+  }, [])
+
+  const selectMode = (mode: SynthMode) => applyParams({ ...paramsRef.current, mode, additive: { ...paramsRef.current.additive, compare: false } })
+  const selectClassic = (waveform: Waveform) => applyParams({ ...paramsRef.current, mode: 'classic', waveform, additive: { ...paramsRef.current.additive, compare: false } })
+  const editHarmonics = (additive: AdditiveConfig) => applyParams({ ...paramsRef.current, mode: 'additive', additive: { ...copyAdditive(additive), compare: false } })
+  const loadHarmonicTemplate = (id: string) => {
+    const template = HARMONIC_TEMPLATES.find(item => item.id === id)
+    if (!template) return
+    applyParams({ ...paramsRef.current, mode: 'additive', additive: copyAdditive(template.config), amplitude: 0.2,
+      adsr: { attack: 0.01, decay: 0.05, sustain: 1, release: 0.15 }, filter: { ...paramsRef.current.filter, bypass: true }, lfo: { ...paramsRef.current.lfo, enabled: false } })
+    const message = `${template.name}: гармоники загружены. ADSR: 0.01 / 0.05 / 100% / 0.15 с; Amplitude 20%; фильтр в Bypass; LFO выключен. Частота и удерживаемые ноты сохранены.`
+    setPatchStatus(message); setNotice(message)
+  }
+  const compareClassic = (waveform: Waveform, mode: SynthMode) => {
+    const firstComparison = !paramsRef.current.additive.compare || paramsRef.current.waveform !== waveform
+    const template = HARMONIC_TEMPLATES.find(item => item.classic === waveform)
+    const additive = firstComparison && template ? copyAdditive(template.config) : copyAdditive(paramsRef.current.additive)
+    applyParams({ ...paramsRef.current, mode, waveform, additive: { ...additive, compare: true },
+      ...(firstComparison ? { amplitude: 0.2, adsr: { attack: 0.01, decay: 0.05, sustain: 1, release: 0.15 },
+        filter: { ...paramsRef.current.filter, bypass: true }, lfo: { ...paramsRef.current.lfo, enabled: false } } : {}) })
+    setPatchStatus(`${firstComparison ? `${template?.name ?? waveform} загружен; ADSR 0.01 / 0.05 / 100% / 0.15 с, Amplitude 20%, Bypass, LFO выключен. ` : ''}Compare: уровень Classic уменьшен по расчётному RMS аддитивной суммы. Реальная громкость может немного различаться. Удерживаемая нота сохраняется; 16 гармоник лишь приближают классическую форму.`)
+  }
+  const resetHarmonics = () => {
+    editHarmonics(defaultAdditive())
+    setPatchStatus('Reset Harmonics: H1 = 100%, H2–H16 = 0%, фазы 0°. Остальные параметры и MIDI-привязки сохранены.')
+  }
+  const saveHarmonicPatch = () => setPatchStatus(saveHarmonicState(paramsRef.current, HARMONIC_PATCH_KEY) ?? 'Harmonic Patch сохранён: режим, уровни, включение и фазы. Solo и Compare временные. MIDI-привязки сохранены.')
+  const loadHarmonicPatch = () => {
+    const loaded = loadHarmonicState(HARMONIC_PATCH_KEY)
+    if (!loaded.state) { setPatchStatus(loaded.error ?? 'Сохранённого Harmonic Patch пока нет. Сначала нажмите Save Harmonic Patch.'); return }
+    applyParams({ ...paramsRef.current, mode: loaded.state.mode, additive: loaded.state.additive })
+    setPatchStatus('Harmonic Patch загружен. Частота, огибающая, фильтр, LFO и MIDI-привязки сохранены.')
+  }
 
   const audioError = useCallback((reason: unknown) => {
     setError(`Не удалось включить аудио: ${reason instanceof Error ? reason.message : String(reason)}. Проверьте разрешение звука в браузере и попробуйте Play снова.`)
@@ -199,13 +251,15 @@ export default function App() {
     refreshAudio()
   }
 
-  const loadParams = (next: SynthParams) => { stopAll(); applyParams(copyParams(next), false); setError(null) }
+  const loadParams = (next: SynthParams) => {
+    stopAll(); applyParams({ ...copyParams(next), additive: { ...copyAdditive(paramsRef.current.additive), solo: null, compare: false } }, false); setError(null)
+  }
   const loadLesson = (lesson: Lesson) => {
     loadParams(lesson.params); setPresetId(''); setLoadedLesson(lesson.id)
     setNotice(`Демо «${lesson.shortTitle}» готово. Нажмите Play или сыграйте аккорд.`)
   }
   const reset = () => {
-    loadParams(DEFAULT_PARAMS); setPresetId(''); setLoadedLesson(null)
+    stopAll(); applyParams(copyParams(DEFAULT_PARAMS), false); setError(null); setPresetId(''); setLoadedLesson(null)
     setNotice('Исходные параметры восстановлены. MIDI-привязки сохранены. Нажмите Play или сыграйте ноты.')
   }
   const beginLearn = (target: MidiTargetId) => { stopAll(); midiRef.current?.beginLearn(target) }
@@ -263,11 +317,12 @@ export default function App() {
     }
     if (target === 'waveform.next') {
       const index = WAVES.findIndex(item => item.id === paramsRef.current.waveform)
-      change('waveform', WAVES[(index + 1) % WAVES.length].id)
+      selectClassic(WAVES[(index + 1) % WAVES.length].id)
     } else if (target.startsWith('waveform.')) {
       const waveform = WAVES.find(item => item.id === target.slice(9))?.id
-      if (waveform) change('waveform', waveform)
-    } else if (target === 'filter.bypass') change('filter', { ...paramsRef.current.filter, bypass: !paramsRef.current.filter.bypass })
+      if (waveform) selectClassic(waveform)
+    } else if (target === 'synthesis.mode') selectMode(paramsRef.current.mode === 'classic' ? 'additive' : 'classic')
+    else if (target === 'filter.bypass') change('filter', { ...paramsRef.current.filter, bypass: !paramsRef.current.filter.bypass })
     else if (target === 'lfo.enabled') change('lfo', { ...paramsRef.current.lfo, enabled: !paramsRef.current.lfo.enabled })
     else if (target === 'lfo.target') change('lfo', { ...paramsRef.current.lfo, target: paramsRef.current.lfo.target === 'pitch' ? 'filter' : 'pitch' })
   }
@@ -306,11 +361,14 @@ export default function App() {
     id: String(voice.instanceId), midi: voice.midi!, frequency: voice.frequency * 2 ** (voice.pitchBend / 12), sourceName: voice.sourceName, channel: voice.channel!,
   }))
   const scopeFrequency = voices.length ? Math.min(...voices.map(voice => voice.frequency * 2 ** (voice.pitchBend / 12))) : params.frequency
+  const referenceVoice = [...voices].reverse().find(voice => voice.gateOpen && !voice.retiring)
+  const referenceFrequency = referenceVoice ? referenceVoice.frequency * 2 ** (referenceVoice.pitchBend / 12) : params.frequency
+  const referenceLabel = referenceVoice?.midi !== null && referenceVoice?.midi !== undefined ? `${midiName(referenceVoice.midi)} · ${referenceVoice.sourceName} (последняя удерживаемая)` : 'Play · Frequency'
 
   return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className="app-shell">
     <header className="app-header">
       <a className="brand" href="#main" aria-label="SOUND LAB — к лаборатории"><span className="brand-mark"><svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M4 18h5l4-11 8 22 6-17 3 6h3" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" /></svg></span><span>SOUND <strong>LAB</strong><small>Лаборатория звукового синтеза</small></span></a>
-      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">ЛОКАЛЬНО <span>v0.3</span></span></div>
+      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">ЛОКАЛЬНО <span>v0.4</span></span></div>
     </header>
 
     <main id="main">
@@ -331,11 +389,15 @@ export default function App() {
           <SectionHeading index="01" title="Осциллятор" term="OSCILLATOR · ИСТОЧНИК ЗВУКА" hint="Осциллятор создаёт периодические колебания. Frequency задаёт высоту, Amplitude — уровень, Waveform — тембр.">
             <button className={`play-button ${audio.auditionGateOpen ? 'is-playing' : ''}`} onClick={togglePlay} aria-label={audio.auditionGateOpen ? 'Остановить тон Play' : 'Включить тон Play'} title="Play и Stop управляют отдельным тоном. Клавиши продолжают звучать; Panic останавливает все голоса."><span className={audio.auditionGateOpen ? 'stop-symbol' : 'play-symbol'} aria-hidden="true" />{audio.auditionGateOpen ? 'Stop' : 'Play'}<span className="play-label">{audio.auditionGateOpen ? 'Отпустить Play' : 'Слушать тон'}</span></button>
           </SectionHeading>
-          <div className="oscillator-controls"><div className="waveform-control"><div className="control-label">Форма волны <span className="term">Waveform</span><MidiLearnButton target="waveform" /><Hint text="Форма волны определяет набор и уровни гармоник — окраску звука, или тембр. Значки — условные формы; графики выше измеряют реальный сигнал." /></div><div className="waveform-options" role="group" aria-label="Форма волны">{WAVES.map(wave => <button key={wave.id} aria-pressed={params.waveform === wave.id} title={wave.hint} onClick={() => change('waveform', wave.id)}><WaveIcon waveform={wave.id} /><strong>{wave.english}</strong><span>{wave.name}</span></button>)}</div></div>
+          <div className="oscillator-controls"><div className="waveform-control"><div className="control-label">Форма волны <span className="term">Classic Waveform</span><MidiLearnButton target="waveform" /><Hint text="Эти четыре кнопки включают Classic Oscillator. Аддитивный тембр строится в Harmonic Builder ниже. Значки условные; графики выше измеряют реальный сигнал." /></div><div className="waveform-options" role="group" aria-label="Форма волны">{WAVES.map(wave => <button key={wave.id} aria-pressed={params.mode === 'classic' && params.waveform === wave.id} title={wave.hint} onClick={() => selectClassic(wave.id)}><WaveIcon waveform={wave.id} /><strong>{wave.english}</strong><span>{wave.name}</span></button>)}</div></div>
             <div className="oscillator-parameters"><Parameter midiTarget="frequency" name="Частота" term="Frequency" hint="Число колебаний в секунду, в герцах (Hz). Больше частота — выше тон. Frequency управляет отдельным тоном Play. Высоты удерживаемых клавиш не меняются." value={params.frequency} min={20} max={20000} step={0.1} unit="Hz" precision={2} logarithmic onChange={manualFrequency} endpoints={['20 Hz · низко', '20 kHz · высоко']} />
             <Parameter midiTarget="amplitude" name="Амплитуда" term="Amplitude" hint="Уровень сигнала до выхода: 100% = множитель 1. Влияет на воспринимаемую громкость. Итоговую громкость также задают огибающая, фильтр и ваши колонки." value={params.amplitude * 100} min={0} max={100} step={1} unit="%" precision={0} onChange={value => change('amplitude', value / 100)} /></div></div>
           <div className="sound-properties"><span><i className="property-dot pitch-dot" /><b>Частота</b> → высота</span><span><i className="property-dot level-dot" /><b>Амплитуда</b> → громкость</span><span><i className="property-dot timbre-dot" /><b>Форма волны</b> → тембр</span></div>
         </section>
+
+        <HarmonicBuilder params={params} onChange={editHarmonics} onMode={selectMode} onTemplate={loadHarmonicTemplate}
+          onCompare={compareClassic} onReset={resetHarmonics} onSave={saveHarmonicPatch} onLoad={loadHarmonicPatch}
+          patchStatus={patchStatus} referenceFrequency={referenceFrequency} referenceLabel={referenceLabel} sampleRate={getAnalysis()?.sampleRate ?? 48000} />
 
         <section className="panel envelope-panel" aria-label="Огибающая ADSR">
           <SectionHeading index="02" title="Характер звука" term="ОГИБАЮЩАЯ · ADSR" hint="ADSR управляет громкостью ноты во времени. Attack — нарастание, Decay — спад, Sustain — уровень удержания, Release — затухание после отпускания."><div className="envelope-presets" role="group" aria-label="Примеры огибающей">{ENVELOPE_PRESETS.map(preset => <button title={preset.description} key={preset.id} onClick={() => { change('adsr', { ...preset.adsr }); setNotice(`${preset.name}: ${preset.description} Отпустите и снова нажмите клавишу.`); }}>{preset.name}</button>)}</div></SectionHeading>
@@ -363,6 +425,6 @@ export default function App() {
         {error && <div className="error-message" role="alert">{error}</div>}
       </div><LessonPanel onLoad={loadLesson} loadedLesson={loadedLesson} /></div>
     </main>
-    <footer className="app-footer"><span>SOUND LAB <span>0.3</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
+    <footer className="app-footer"><span>SOUND LAB <span>0.4</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
   </div></MidiLearnProvider>
 }

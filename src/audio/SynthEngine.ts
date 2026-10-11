@@ -2,6 +2,8 @@ import { copyParams, type AnalysisNodes, type SynthParams, type Waveform } from 
 import { SynthVoice } from './SynthVoice'
 import { MAX_RETIRING_VOICES, MAX_VOICES, VoiceManager, voiceMatches } from './VoiceManager'
 import type { VoiceNote, VoiceScope, VoiceSnapshot } from './voiceTypes'
+import { getClassicComparisonGain, getHarmonicCoefficients, getHarmonicScale } from '../harmonics/model'
+import { clearPeriodicWaveCache, getPeriodicWaveCache, PERIODIC_WAVE_CACHE_LIMIT, type PeriodicWaveCache } from './PeriodicWaveCache'
 
 const MIN_FREQUENCY = 440 * 2 ** ((0 - 69) / 12)
 const MIX_HEADROOM = 0.25
@@ -53,6 +55,8 @@ export class SynthEngine {
   private params: SynthParams
   private context: AudioContext | null = null
   private graph: Graph | null = null
+  private waveCache: PeriodicWaveCache | null = null
+  private waveBuildCount = 0
   private voices = new VoiceManager()
   // Intents survive voice stealing until the corresponding physical Note Off.
   private intents = new Map<string, NoteRequest>()
@@ -282,6 +286,15 @@ export class SynthEngine {
       waveform, pendingWaveform: waveform !== this.params.waveform ? this.params.waveform : null,
       disposed: this.disposed, velocity, velocityGain: velocity / 127,
       pitchBend: latest?.pitchBend ?? this.auditionPitchBend,
+      mode: this.params.mode, carrierMode: latestVoice?.getMode() ?? this.params.mode,
+      pendingTimbre: latestVoice?.hasPendingTimbre() ?? false,
+      additiveScale: getHarmonicScale(this.params.additive),
+      additiveCoefficients: getHarmonicCoefficients(this.params.additive),
+      comparisonGain: this.params.mode === 'classic' && this.params.additive.compare
+        ? getClassicComparisonGain(this.params.additive, this.params.waveform) : 1,
+      periodicWaveCacheSize: this.waveCache?.size ?? 0,
+      periodicWaveBuildCount: this.waveCache?.buildCount ?? this.waveBuildCount,
+      periodicWaveCacheLimit: PERIODIC_WAVE_CACHE_LIMIT,
       voices: snapshots, voiceCount: this.voices.count, managedCount: this.voices.count,
       retiringCount: this.voices.retiringCount, pendingCount: this.pending.size,
       maxVoices: MAX_VOICES, maxRetiringVoices: MAX_RETIRING_VOICES,
@@ -305,6 +318,9 @@ export class SynthEngine {
       if (context.state === 'running') await new Promise<void>(resolve => setTimeout(resolve, 30))
       context.removeEventListener('statechange', this.onContextStateChange)
       this.voices.destroyAll()
+      this.waveBuildCount = this.waveCache?.buildCount ?? this.waveBuildCount
+      clearPeriodicWaveCache(context)
+      this.waveCache = null
       if (this.graph) {
         try { this.graph.lfo.stop() } catch { /* May already be closed. */ }
         for (const node of Object.values(this.graph)) node.disconnect()
@@ -319,6 +335,7 @@ export class SynthEngine {
   private initialize(): void {
     const context = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' })
     this.context = context
+    this.waveCache = getPeriodicWaveCache(context)
     const graph: Graph = {
       input: context.createGain(), filter: context.createBiquadFilter(),
       dry: context.createGain(), wet: context.createGain(), amplitude: context.createGain(),
