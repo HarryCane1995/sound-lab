@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react'
+import { useId, useMemo, useRef, useState } from 'react'
 import { copyAdditive, type AdditiveConfig, type SynthMode, type SynthParams, type Waveform } from '../types'
 import { HARMONIC_EXPERIMENTS, HARMONIC_TEMPLATES } from '../content/harmonics'
 import { getHarmonicCoefficients, getHarmonicScale } from '../harmonics/model'
@@ -73,7 +73,12 @@ export function HarmonicBuilder({ params, onChange, onMode, onTemplate, onCompar
   const [additional, setAdditional] = useState(2)
   const [comparison, setComparison] = useState<'square' | 'sawtooth' | 'triangle'>('square')
   const config = params.additive
-  const update = (change: (next: AdditiveConfig) => void) => { const next = copyAdditive(config); change(next); onChange(next) }
+  const latestConfig = useRef(config)
+  latestConfig.current = config
+  const update = (change: (next: AdditiveConfig) => void) => {
+    const next = copyAdditive(latestConfig.current)
+    change(next); latestConfig.current = next; onChange(next)
+  }
   const loadTemplate = (id: string) => {
     const wave = HARMONIC_TEMPLATES.find(template => template.id === id)?.classic
     if (wave === 'square' || wave === 'sawtooth' || wave === 'triangle') setComparison(wave)

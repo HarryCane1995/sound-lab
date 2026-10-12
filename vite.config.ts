@@ -20,7 +20,7 @@ export default defineConfig(({ command, mode, isPreview }) => {
       includeAssets: [],
       manifest: {
         id: base, name: 'SOUND LAB', short_name: 'SOUND LAB', lang: 'ru',
-        description: 'Услышать, увидеть, понять: синтезатор и библиотека музыкальных фраз.',
+        description: 'SOUND LAB Studio: синтезатор, GPU Visual Lab и библиотека музыкальных фраз.',
         start_url: base, scope: base, display: 'standalone',
         background_color: '#0b0e14', theme_color: '#0b0e14',
         icons: [

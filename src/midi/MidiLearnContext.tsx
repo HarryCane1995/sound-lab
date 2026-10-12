@@ -30,6 +30,18 @@ export function useMidiActivity(timestamp: number, duration = 1500) {
   return recent
 }
 
+/** Presentation hook shared by compact controls; binding IDs and storage stay unchanged. */
+export function useMidiLearnTarget(target?: MidiTargetId) {
+  const { state, onLearn } = useContext(MidiLearnContext)
+  const controlled = useMidiActivity(target && state.lastControlled?.target === target ? state.lastControlled.timestamp : 0, 350)
+  return {
+    armed: Boolean(target && state.learning === target),
+    bound: Boolean(target && state.bindings.some(binding => binding.target === target)),
+    controlled,
+    beginLearn: () => { if (target) onLearn(target) },
+  }
+}
+
 export function MidiLearnButton({ target }: { target: MidiTargetId }) {
   const { state, onLearn } = useContext(MidiLearnContext)
   const metadata = TARGETS.find(item => item.id === target)

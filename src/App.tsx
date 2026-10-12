@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { SynthEngine } from './audio/SynthEngine'
 import type { VoiceSnapshot } from './audio/voiceTypes'
 import { Hint, Parameter, SectionHeading, Toggle, WaveIcon } from './components/Controls'
@@ -18,15 +18,24 @@ import type { HeldNote } from './midi/HeldNotes'
 import { getTargetNormalized, setTargetNormalized } from './midi/targets'
 import { INITIAL_MIDI_STATE } from './midi/types'
 import type { MidiCallbacks, MidiMessage, MidiState, MidiTargetId } from './midi/types'
-import { MidiLearnButton, MidiLearnProvider } from './midi/MidiLearnContext'
+import { MidiLearnButton, MidiLearnProvider, useMidiActivity } from './midi/MidiLearnContext'
 import { MidiPanel } from './components/MidiPanel'
 import { PhraseRecorder } from './components/PhraseRecorder'
 import { usePhraseRecorder, type PhraseController } from './phrases/usePhraseRecorder'
 import { PwaPanel } from './pwa/PwaPanel'
 import { preserveUpdateSound, restoreUpdateSound } from './pwa/soundState'
+import { GpuVisualLab } from './visuals/GpuVisualLab'
+import { StudioSynthControls } from './components/StudioSynthControls'
+import { CompactHarmonics } from './components/CompactHarmonics'
+import { readDisplay, readWorkspace, saveDisplay, WORKSPACE_KEY, type WorkspaceMode, type StudioDensity } from './studio/preferences'
 import './midi/midi.css'
 
 const midiSource = (id: string) => `midi:${JSON.stringify(id)}`
+const MIDI_STATUS_LABELS: Record<MidiState['status'], string> = {
+  idle: 'Не подключён', connecting: 'Подключение…', ready: 'Подключён',
+  'no-devices': 'Нет входов', denied: 'Доступ запрещён', unsupported: 'Недоступен',
+  disconnected: 'Отключён', error: 'Ошибка',
+}
 const updateSound = restoreUpdateSound()
 
 const WAVES: { id: Waveform; name: string; english: string; hint: string }[] = [
@@ -37,11 +46,27 @@ const WAVES: { id: Waveform; name: string; english: string; hint: string }[] = [
 ]
 
 export default function App() {
+  const [workspaceMode, setWorkspaceMode] = useState(readWorkspace)
+  const [display, setDisplay] = useState(readDisplay)
+  const [midiOpen, setMidiOpen] = useState(false)
+  const [transportTarget, setTransportTarget] = useState<HTMLDivElement | null>(null)
+  const outputMeter = useRef<HTMLMeterElement>(null)
+  const updateMeter = useCallback((rms: number | null) => { if (outputMeter.current) { outputMeter.current.hidden = rms === null; outputMeter.current.value = Math.min(1, rms ?? 0); outputMeter.current.title = rms === null ? 'RMS доступен в GPU-режиме' : `Измеренный выход: RMS ${rms.toFixed(4)}` } }, [])
+  const studio = workspaceMode === 'studio'
+  const switchWorkspace = (mode: WorkspaceMode) => {
+    setWorkspaceMode(mode)
+    try { localStorage.setItem(WORKSPACE_KEY, mode) } catch { /* Session still works without persistence. */ }
+  }
+  const changeDisplay = (density: StudioDensity, scale: number) => {
+    const next = { density, scale: Math.max(80, Math.min(110, scale)) }
+    setDisplay(next); saveDisplay(next.density, next.scale)
+  }
   const [initialHarmonics] = useState(() => loadHarmonicState())
   const [params, setParams] = useState<SynthParams>(() => copyParams(updateSound ?? { ...DEFAULT_PARAMS,
     mode: initialHarmonics.state?.mode ?? 'classic', additive: initialHarmonics.state?.additive ?? DEFAULT_PARAMS.additive }))
   const [patchStatus, setPatchStatus] = useState(initialHarmonics.error ?? 'Режим и гармоники сохраняются автоматически. Solo и Compare действуют только в этой сессии.')
   const paramsRef = useRef(params)
+  const harmonicCommit = useRef({ pending: false, revision: 0 })
   const engineRef = useRef<SynthEngine | null>(null)
   const phraseRef = useRef<PhraseController | null>(null)
   const [audio, setAudio] = useState({ contextState: 'not-started', gateOpen: false, audible: false, auditionGateOpen: false, pendingCount: 0 })
@@ -56,6 +81,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [octave, setOctave] = useState(3)
   const [midiState, setMidiState] = useState<MidiState>(INITIAL_MIDI_STATE)
+  const midiActivity = useMidiActivity(midiState.lastActivity, 350)
+  useEffect(() => {
+    if (studio && midiState.conflict) setMidiOpen(true)
+  }, [studio, midiState.conflict])
   const midiRef = useRef<MidiController | null>(null)
   const midiHandlers = useRef<Omit<MidiCallbacks, 'onState'> | null>(null)
   const pitchBends = useRef(new Map<string, { sourceId: string; channel: number; value: number }>())
@@ -101,6 +130,8 @@ export default function App() {
 
   const syncHeld = useCallback(() => setHeldNotes(held.current.values), [])
   const applyParams = useCallback((next: SynthParams, custom = true) => {
+    harmonicCommit.current.pending = false
+    harmonicCommit.current.revision++
     paramsRef.current = copyParams(next)
     engineRef.current?.setParams(paramsRef.current)
     setParams(paramsRef.current)
@@ -124,7 +155,20 @@ export default function App() {
 
   const selectMode = (mode: SynthMode) => applyParams({ ...paramsRef.current, mode, additive: { ...paramsRef.current.additive, compare: false } })
   const selectClassic = (waveform: Waveform) => applyParams({ ...paramsRef.current, mode: 'classic', waveform, additive: { ...paramsRef.current.additive, compare: false } })
-  const editHarmonics = (additive: AdditiveConfig) => applyParams({ ...paramsRef.current, mode: 'additive', additive: { ...copyAdditive(additive), compare: false } })
+  const editHarmonics = (additive: AdditiveConfig) => {
+    const next: SynthParams = { ...paramsRef.current, mode: 'additive', additive: { ...copyAdditive(additive), compare: false } }
+    if (!studio) { applyParams(next); return }
+    // Retain every fader edit immediately, then build one timbre per input task.
+    // A preset/MIDI/other parameter update supersedes this pending commit.
+    paramsRef.current = next
+    if (harmonicCommit.current.pending) return
+    harmonicCommit.current.pending = true
+    const revision = harmonicCommit.current.revision
+    queueMicrotask(() => {
+      if (!harmonicCommit.current.pending || harmonicCommit.current.revision !== revision || !engineRef.current) return
+      applyParams(paramsRef.current)
+    })
+  }
   const loadHarmonicTemplate = (id: string) => {
     const template = HARMONIC_TEMPLATES.find(item => item.id === id)
     if (!template) return
@@ -404,27 +448,49 @@ export default function App() {
   const referenceFrequency = referenceVoice ? referenceVoice.frequency * 2 ** (referenceVoice.pitchBend / 12) : params.frequency
   const referenceLabel = referenceVoice?.midi !== null && referenceVoice?.midi !== undefined ? `${midiName(referenceVoice.midi)} · ${referenceVoice.sourceName} (последняя удерживаемая)` : 'Play · Frequency'
 
-  return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className="app-shell">
+  const harmonicProps = { params, onChange: editHarmonics, onMode: selectMode, onTemplate: loadHarmonicTemplate,
+    onCompare: compareClassic, onReset: resetHarmonics, onSave: saveHarmonicPatch, onLoad: loadHarmonicPatch,
+    patchStatus, referenceFrequency, referenceLabel, sampleRate: getAnalysis()?.sampleRate ?? 48000 }
+  const choosePreset = (id: string) => {
+    const preset = PRESETS.find(item => item.id === id)
+    if (!preset) return
+    loadParams(preset.params); setPresetId(preset.id); setLoadedLesson(null); setNotice(preset.description)
+  }
+  const resetOscillator = () => {
+    applyParams({ ...paramsRef.current, frequency: DEFAULT_PARAMS.frequency, amplitude: DEFAULT_PARAMS.amplitude,
+      mode: 'classic', waveform: 'sine', additive: { ...copyAdditive(paramsRef.current.additive), compare: false } })
+    setNotice('Oscillator: Sine · 220 Hz · 25%. Гармоники, ADSR, фильтр, LFO и MIDI сохранены.')
+  }
+  return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className={`app-shell ${studio ? 'studio-shell' : 'learn-shell'} density-${display.density}`} style={{ '--studio-scale': display.scale / 100 } as CSSProperties}>
     <header className="app-header">
       <a className="brand" href="#main" aria-label="SOUND LAB — к лаборатории"><span className="brand-mark"><svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M4 18h5l4-11 8 22 6-17 3 6h3" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" /></svg></span><span>SOUND <strong>LAB</strong><small>Лаборатория звукового синтеза</small></span></a>
-      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">{import.meta.env.DEV ? 'DEVELOPMENT' : 'PWA'} <span>v{__APP_VERSION__}</span></span></div>
+      {studio && <><label className="studio-patch"><span>PATCH</span><select aria-label="Звуковой пресет Studio" value={presetId} onChange={event => choosePreset(event.target.value)}><option value="" disabled>Свои настройки</option>{PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label><div className="studio-top-transport" ref={setTransportTarget} /></>}
+      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{studio ? `${voices.filter(voice => !voice.retiring).length}/16 VOICES` : audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span>
+        {studio && <><meter className="studio-output-meter" ref={outputMeter} aria-label="Уровень выхода RMS" min={0} max={1} low={0.01} high={0.7} optimum={0.15} defaultValue={0} title="Измеренный RMS выхода в GPU-режиме" /><button className={`studio-midi-status ${midiActivity ? 'has-activity' : ''}`} data-status={midiState.status} aria-label="MIDI Monitor и привязки" aria-expanded={midiOpen} onClick={() => setMidiOpen(value => !value)} title={`${MIDI_STATUS_LABELS[midiState.status]} · ${midiState.message}`}><i /><span>{midiState.inputs.find(input => input.id === midiState.selectedId)?.name ?? 'MIDI'}</span><small><b>{MIDI_STATUS_LABELS[midiState.status]}</b><span> · VEL {velocity ?? '—'} · BEND {pitchBend.toFixed(1)}</span></small></button></>}
+        <nav className="workspace-mode" aria-label="Рабочее пространство"><button aria-pressed={studio} onClick={() => switchWorkspace('studio')}>Studio</button><button aria-pressed={!studio} onClick={() => switchWorkspace('learn')}>Learn</button></nav>
+        <details className="studio-settings"><summary>Settings</summary><div><label>Плотность<select aria-label="Плотность интерфейса" value={display.density} onChange={event => changeDisplay(event.target.value as StudioDensity, display.scale)}><option value="compact">Compact</option><option value="comfortable">Comfortable</option></select></label><label>Масштаб · {display.scale}%<input aria-label="Масштаб интерфейса" type="range" min="80" max="110" step="5" value={display.scale} onChange={event => changeDisplay(display.density, Number(event.target.value))} /></label><button onClick={reset}>Сбросить все параметры</button><button onClick={() => { stopAll(); setNotice('Panic: все голоса остановлены.') }}>Panic · Esc</button><p>Размеры панелей и регуляторов адаптируются к окну. Двойной щелчок ручки — точный ввод; Shift — медленнее; ПКМ или M — MIDI Learn.</p><span>SOUND LAB {__APP_VERSION__} · {import.meta.env.DEV ? 'Development' : 'PWA'}</span></div></details>
+        {!studio && <span className="version-tag">{import.meta.env.DEV ? 'DEVELOPMENT' : 'PWA'} <span>v{__APP_VERSION__}</span></span>}</div>
     </header>
     <PwaPanel blocked={blockUpdate} prepare={prepareUpdate} />
 
     <main id="main">
-      <div className="page-heading"><div><span className="eyebrow">УСЛЫШАТЬ. УВИДЕТЬ. ПОНЯТЬ.</span><h1>Из чего состоит звук<span>?</span></h1><p>Меняйте один параметр. Слушайте разницу. Следите за сигналом.</p></div><div className="preset-toolbar"><label htmlFor="preset-select">ОТПРАВНАЯ ТОЧКА <Hint text="Пресет — готовый набор параметров. Загрузка останавливает все голоса. Сыграйте новые ноты или нажмите Play, чтобы услышать пресет." /></label><div><select id="preset-select" value={presetId} onChange={event => {
+      {studio && <h1 className="sr-only">SOUND LAB Studio</h1>}
+      {!studio && <div className="page-heading"><div><span className="eyebrow">УСЛЫШАТЬ. УВИДЕТЬ. ПОНЯТЬ.</span><h1>Из чего состоит звук<span>?</span></h1><p>Меняйте один параметр. Слушайте разницу. Следите за сигналом.</p></div><div className="preset-toolbar"><label htmlFor="preset-select">ОТПРАВНАЯ ТОЧКА <Hint text="Пресет — готовый набор параметров. Загрузка останавливает все голоса. Сыграйте новые ноты или нажмите Play, чтобы услышать пресет." /></label><div><select id="preset-select" value={presetId} onChange={event => {
         const preset = PRESETS.find(item => item.id === event.target.value)
         if (!preset) return
         loadParams(preset.params); setPresetId(preset.id); setLoadedLesson(null); setNotice(preset.description)
-      }}><option value="" disabled>Свои настройки</option>{PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select><button className="reset-button" aria-label="Сбросить все параметры" title="Reset — вернуть исходные параметры и остановить звук" onClick={reset}>↺ <span>Сброс</span></button><MidiLearnButton target="reset" /></div></div></div>
+      }}><option value="" disabled>Свои настройки</option>{PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select><button className="reset-button" aria-label="Сбросить все параметры" title="Reset — вернуть исходные параметры и остановить звук" onClick={reset}>↺ <span>Сброс</span></button><MidiLearnButton target="reset" /></div></div></div>}
 
       <div className="workspace"><div className="synth-workspace">
-        <SignalVisualizers getAnalysis={getAnalysis} frequency={scopeFrequency} playing={audio.audible} waveform={params.waveform} cutoff={params.filter.cutoff} filterBypassed={params.filter.bypass} />
+        {studio ? <><div className="studio-upper"><GpuVisualLab getAnalysis={getAnalysis} frequency={scopeFrequency} playing={audio.audible} waveform={params.waveform} cutoff={params.filter.cutoff} filterBypassed={params.filter.bypass} onLevel={updateMeter} /><StudioSynthControls params={params} onChange={change} onFrequency={manualFrequency} onMode={selectMode} onClassic={selectClassic} onPlay={togglePlay} playing={audio.auditionGateOpen} onOscillatorReset={resetOscillator} /></div><CompactHarmonics {...harmonicProps} /></> : <SignalVisualizers getAnalysis={getAnalysis} frequency={scopeFrequency} playing={audio.audible} waveform={params.waveform} cutoff={params.filter.cutoff} filterBypassed={params.filter.bypass} />}
+        <div className={studio ? 'studio-midi-drawer' : 'learn-midi-holder'} hidden={studio && !midiOpen}>
+        {studio && <button className="studio-drawer-close" aria-label="Закрыть MIDI Monitor" onClick={() => setMidiOpen(false)}>Закрыть ×</button>}
         <MidiPanel state={midiState} velocity={velocity} activeNotes={midiNotes} pitchBend={pitchBend} modulation={modulation} bendRange={bendRange} onBendRange={changeBendRange}
           onConnect={connectMidi} onSelectInput={id => midiRef.current?.selectInput(id)} onLearn={beginLearn} onCancelLearn={() => midiRef.current?.cancelLearn()}
           onResolveConflict={replace => midiRef.current?.resolveConflict(replace)} onRemoveBinding={id => midiRef.current?.removeBinding(id)} onBindingMode={(id, mode) => midiRef.current?.setBindingMode(id, mode)}
-          onClearBindings={() => midiRef.current?.clearBindings()} onClearMonitor={() => midiRef.current?.clearMonitor()} onPanic={() => { stopAll(); setNotice('Panic: все ноты остановлены.'); }} />
+          onClearBindings={() => midiRef.current?.clearBindings()} onClearMonitor={() => midiRef.current?.clearMonitor()} onPanic={() => { stopAll(); setNotice('Panic: все ноты остановлены.'); }} /></div>
 
+        {!studio && <>
         <section className="panel oscillator-panel" aria-label="Осциллятор">
           <SectionHeading index="01" title="Осциллятор" term="OSCILLATOR · ИСТОЧНИК ЗВУКА" hint="Осциллятор создаёт периодические колебания. Frequency задаёт высоту, Amplitude — уровень, Waveform — тембр.">
             <button className={`play-button ${audio.auditionGateOpen ? 'is-playing' : ''}`} onClick={togglePlay} aria-label={audio.auditionGateOpen ? 'Остановить тон Play' : 'Включить тон Play'} title="Play и Stop управляют отдельным тоном. Клавиши продолжают звучать; Panic останавливает все голоса."><span className={audio.auditionGateOpen ? 'stop-symbol' : 'play-symbol'} aria-hidden="true" />{audio.auditionGateOpen ? 'Stop' : 'Play'}<span className="play-label">{audio.auditionGateOpen ? 'Отпустить Play' : 'Слушать тон'}</span></button>
@@ -460,11 +526,12 @@ export default function App() {
           {lfoFilterBypassed && <p className="inline-notice">Выключите Bypass фильтра, чтобы услышать модуляцию среза.</p>}
         </section></div>
 
-        <Piano octave={octave} setOctave={next => { releaseLocalNotes(); setOctave(next) }} activeMidis={activeMidis} activeNotes={activeNotes} heldCount={heldNotes.length} voiceCount={voices.length} frequency={params.frequency} onDown={pressNote} onUp={releaseNote} />
-        <PhraseRecorder controller={phraseController} />
+        </>}
+        <Piano key="piano" octave={octave} setOctave={next => { releaseLocalNotes(); setOctave(next) }} activeMidis={activeMidis} activeNotes={activeNotes} heldCount={heldNotes.length} voiceCount={voices.length} frequency={params.frequency} onDown={pressNote} onUp={releaseNote} />
+        <PhraseRecorder key="phrase-recorder" controller={phraseController} compact={studio} transportTarget={studio ? transportTarget : null} />
         <div className="status-strip" role="status"><span className="status-marker" />{notice}<span className="escape-tip"><kbd>Esc</kbd> остановить</span></div>
         {error && <div className="error-message" role="alert">{error}</div>}
-      </div><LessonPanel onLoad={loadLesson} loadedLesson={loadedLesson} /></div>
+      </div><div className="lesson-holder" hidden={studio}><LessonPanel onLoad={loadLesson} loadedLesson={loadedLesson} /></div></div>
     </main>
     <footer className="app-footer"><span>SOUND LAB <span>{__APP_VERSION__}</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
   </div></MidiLearnProvider>

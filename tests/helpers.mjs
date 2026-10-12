@@ -4,6 +4,31 @@ import { existsSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 
 const URL = process.env.SOUND_LAB_TEST_URL || 'http://127.0.0.1:5173/'
+export const WORKSPACE_KEY = 'sound-lab.workspace.v1'
+
+// Legacy suites exercise the retained educational controls. They deliberately
+// select Learn without changing the application's Studio default or weakening
+// any of their original UI/audio assertions. The script also restores Learn
+// after a legacy scenario clears its own isolated test storage and reloads.
+export async function initializeTestWorkspace(target, workspace = 'learn') {
+  if (!['learn', 'studio'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
+  await target.addInitScript(({ key, workspace }) => {
+    try {
+      const saved = localStorage.getItem(key)
+      if (saved !== 'learn' && saved !== 'studio') localStorage.setItem(key, workspace)
+    } catch { /* Storage-denial scenarios must still be able to mount the app. */ }
+  }, { key: WORKSPACE_KEY, workspace })
+}
+
+export async function chooseWorkspace(page, workspace) {
+  if (!['learn', 'studio'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
+  const selected = page.getByRole('button', { name: workspace === 'learn' ? 'Learn' : 'Studio', exact: true })
+  await selected.waitFor()
+  if (await selected.getAttribute('aria-pressed') !== 'true') await selected.click()
+  await page.waitForFunction(label => [...document.querySelectorAll('button')].some(button => button.textContent?.trim() === label && button.getAttribute('aria-pressed') === 'true'), workspace === 'learn' ? 'Learn' : 'Studio')
+  const other = page.getByRole('button', { name: workspace === 'learn' ? 'Studio' : 'Learn', exact: true })
+  if (await other.getAttribute('aria-pressed') !== 'false') throw new Error('Workspace controls must expose a mutually exclusive pressed state')
+}
 
 export function testBrowserExecutable() {
   const override = process.env.SOUND_LAB_BROWSER
@@ -30,11 +55,13 @@ export async function launchTestBrowser(options = {}) {
     ...options,
     executablePath: options.executablePath ?? testBrowserExecutable(),
     headless: options.headless ?? true,
-    args: ['--autoplay-policy=no-user-gesture-required', ...(options.args ?? [])],
+    // Hardwareless Linux CI still exercises an actual WebGL2 implementation;
+    // Windows keeps its native GPU path. This flag only affects test browsers.
+    args: ['--autoplay-policy=no-user-gesture-required', ...(process.platform === 'linux' ? ['--enable-unsafe-swiftshader'] : []), ...(options.args ?? [])],
   })
 }
 
-export async function startTestBrowser() {
+export async function startTestBrowser({ workspace = 'learn' } = {}) {
   mkdirSync('test-results', { recursive: true })
   let server = null
   let browser = null
@@ -51,8 +78,10 @@ export async function startTestBrowser() {
     }
     browser = await launchTestBrowser()
     const page = await browser.newPage({ viewport: { width: 1440, height: 1100 }, deviceScaleFactor: 1 })
+    await initializeTestWorkspace(page, workspace)
     await page.goto(URL)
     await page.locator('h1').waitFor()
+    await chooseWorkspace(page, workspace)
     return { browser, page, close: async () => { await browser.close(); if (server) await server.close() } }
   } catch (error) {
     if (browser) await browser.close()

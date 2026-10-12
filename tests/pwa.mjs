@@ -4,7 +4,7 @@ import { createServer } from 'node:http'
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { launchTestBrowser, testBrowserName } from './helpers.mjs'
+import { chooseWorkspace, initializeTestWorkspace, launchTestBrowser, testBrowserName } from './helpers.mjs'
 
 // This serves the actual production output, never Vite's HMR server. Two copies
 // append harmless JS/HTML markers to the real bundle, change the JS content URL,
@@ -83,6 +83,9 @@ function observe(page) {
 }
 
 async function initialize(testContext) {
+  // Preserve the complete 0.6 educational/PWA regression path. GPU/Studio
+  // offline assertions explicitly switch workspaces later in this suite.
+  await initializeTestWorkspace(testContext, 'learn')
   await testContext.addInitScript(() => {
     const scenario = sessionStorage.getItem('sound-lab.pwa-midi-scenario') ?? 'ready'
     class Port extends EventTarget {
@@ -155,6 +158,31 @@ async function importLibrary(page, envelope) {
   page.once('dialog', dialog => dialog.accept())
   await recorder(page).getByLabel('Import phrase library JSON', { exact: true }).setInputFiles({ name: 'sound-lab-library.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(envelope)) })
   await page.waitForFunction(() => document.querySelector('input[aria-label="Import phrase library JSON"]').value === '')
+}
+
+async function offlineGpu(page) {
+  assert.equal(await page.evaluate(() => navigator.onLine), false)
+  const personalKeys = ['sound-lab.midi.v1', 'sound-lab.harmonics.v1', 'sound-lab.harmonic-patch.v1']
+  const before = await page.evaluate(keys => keys.map(key => localStorage.getItem(key)), personalKeys)
+  await chooseWorkspace(page, 'studio')
+  await page.locator('.gpu-canvas').waitFor()
+  await page.getByRole('button', { name: 'Waveform 3D', exact: true }).click()
+  await page.getByRole('button', { name: 'Включить тон Play', exact: true }).click(); await waitSound(page, true)
+  await page.waitForFunction(() => {
+    const value = document.querySelector('.gpu-canvas')?.gpuDiagnostics?.()
+    return value && value.webgl2 && value.drawCalls > 0 && value.rms > .001 && value.newestWavePeak > .001 && value.analysisReads > 0
+  }, null, { timeout: 10000 })
+  const waveform = await page.locator('.gpu-canvas').evaluate(element => element.gpuDiagnostics())
+  await page.getByRole('button', { name: 'Spectral Landscape', exact: true }).click()
+  await page.waitForFunction(() => {
+    const value = document.querySelector('.gpu-canvas')?.gpuDiagnostics?.()
+    return value && value.mode === 'spectrum' && value.newestSpectrumPeak > -75
+  })
+  const spectrum = await page.locator('.gpu-canvas').evaluate(element => element.gpuDiagnostics())
+  await page.getByRole('button', { name: 'Остановить тон Play', exact: true }).click(); await waitSound(page, false)
+  await chooseWorkspace(page, 'learn')
+  assert.deepEqual(await page.evaluate(keys => keys.map(key => localStorage.getItem(key)), personalKeys), before, 'Offline GPU work must preserve MIDI settings and saved harmonic data')
+  return { waveform, spectrum }
 }
 
 try {
@@ -247,6 +275,7 @@ try {
   assert.equal(await page.getByRole('button', { name: 'Additive Synthesis', exact: true }).getAttribute('aria-pressed'), 'true')
   assert.equal(await page.getByRole('slider', { name: 'Гармоника H2', exact: true }).inputValue(), '50')
   pass('Real offline cold reload runs the production synthesizer, native Web Audio and preserved additive settings', audioMetrics)
+  pass('Offline production Studio loads every GPU resource and renders actual PCM and FFT without a CDN', await offlineGpu(page))
 
   await connect(page)
   await transport(page, 'Record phrase').click(); await status(page, 'Запись')
@@ -485,6 +514,7 @@ try {
   assert.equal(await page.evaluate(() => globalThis.__soundLabPwaFixture), 'b')
   assert.deepEqual(await readStore(page, 'phrases'), beforeUpdate.phrases)
   pass('Updated production version and all saved phrases cold-reload offline after activation')
+  pass('Updated production Studio cold-reloads its complete WebGL2 module and real audio visualizations offline', await offlineGpu(page))
 
   await context.setOffline(false)
   for (const scenario of ['unsupported', 'denied', 'empty']) {

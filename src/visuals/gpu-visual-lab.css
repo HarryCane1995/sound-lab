@@ -1,0 +1,29 @@
+.gpu-visual-lab { min-width: 0; overflow: hidden; display: flex; flex-direction: column; background: #0b121b; }
+.gpu-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #223344; }
+.gpu-mode-controls, .gpu-camera-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.gpu-visual-lab button, .gpu-visual-lab select { min-height: 30px; padding: 5px 8px; font-size: 11px; border-radius: 5px; border: 1px solid #2c4054; background: #111d2a; color: #a9bdcf; }
+.gpu-visual-lab button.active { border-color: #60d3e6; color: #89edff; background: #18313c; }
+.gpu-visual-lab button:focus-visible, .gpu-visual-lab select:focus-visible { outline: 2px solid #65d8ed; outline-offset: 2px; }
+.gpu-canvas-wrap { min-height: 210px; flex: 1; position: relative; overflow: hidden; }
+.gpu-canvas-host { position: absolute; inset: 0; }
+.gpu-canvas { width: 100%; height: 100%; min-height: 210px; display: block; touch-action: none; }
+.gpu-measurement-overlay { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.gpu-tick { position: absolute; left: 0; top: 0; color: #829eaf; font: 10px "IBM Plex Mono", Consolas, monospace; text-shadow: 0 1px 3px #000; padding: 2px 3px; background: #080e15b0; border-radius: 2px; white-space: nowrap; }
+.gpu-tick-x { margin-top: 8px; }
+.gpu-tick-y { margin-left: -48px; }
+.gpu-tick-z { margin-left: -4px; margin-top: -15px; color: #6f8595; }
+.gpu-clipped { position: absolute; top: 9px; right: 10px; color: #f8c06b; background: #101721e0; padding: 4px 7px; border-radius: 4px; font-size: 10px; }
+.gpu-axis-labels { pointer-events: none; position: absolute; left: 12px; bottom: 9px; display: flex; flex-wrap: wrap; gap: 8px 18px; color: #8ca7b9; font-size: 10px; font-family: "IBM Plex Mono", Consolas, monospace; text-shadow: 0 1px 4px #000; }
+.gpu-live-tag { position: absolute; top: 10px; left: 12px; color: #6fcbd8; font-size: 10px; pointer-events: none; }
+.gpu-live-tag.frozen { color: #f8c06b; }
+.gpu-options { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 14px; padding: 7px 12px; border-top: 1px solid #223344; }
+.gpu-options label { display: flex; align-items: center; gap: 6px; color: #829aaf; font-size: 9px; letter-spacing: .05em; }
+.gpu-options select { min-height: 26px; padding: 3px 6px; }
+.gpu-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 15px; padding: 6px 12px 9px; font-size: 10px; color: #8297ab; }
+.gpu-compatible { min-height: 260px; }
+.gpu-compatible .signal-visualizers { margin: 0; gap: 6px; }
+.gpu-compatible .visual-panel { box-shadow: none; border: 0; background: transparent; }
+.gpu-compatible .visual-panel .panel-heading { padding: 8px 10px; }
+.gpu-compatible .visual-panel h2 { font-size: 14px; }
+.gpu-compatible .visual-caption { font-size: 9px; }
+@media (max-width: 650px) { .gpu-toolbar { padding: 8px; } .gpu-visual-lab button { min-height: 36px; } .gpu-canvas { min-height: 240px; } .gpu-options { gap: 8px; padding: 7px 8px; } .gpu-footer { font-size: 10px; } .gpu-compatible .signal-visualizers { grid-template-columns: 1fr; } }
