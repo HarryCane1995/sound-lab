@@ -1,12 +1,16 @@
 import { copyParams, type SynthMode, type SynthParams, type Waveform } from '../types'
 import { getClassicComparisonGain, getHarmonicCoefficients } from '../harmonics/model'
 import { getPeriodicWaveCache, harmonicKey, type PeriodicWaveCache } from './PeriodicWaveCache'
+import { createEnvelopeControl, type EnvelopeLease, type EnvelopeProcessorState } from './EnvelopeControl'
 import type { EnvelopePhase, VoiceNote, VoiceSnapshot } from './voiceTypes'
 
 const MIN_ENVELOPE_SECONDS = 0.004
 const WAVE_FADE_SECONDS = 0.025
 const SMOOTH_SECONDS = 0.025
-export const CONTROL_LEAD_FRAMES = 128
+// Native Windows captures deliver control plans up to four render quanta after
+// the main-thread currentTime snapshot. Keep one further quantum of headroom;
+// this schedules the original ADSR ahead, without stretching its attack/tail.
+export const CONTROL_LEAD_FRAMES = 640
 
 interface Ramp { start: number; end: number; from: number; to: number }
 interface EnvelopeRamp extends Ramp { phase: EnvelopePhase }
@@ -29,8 +33,13 @@ function smooth(param: AudioParam, value: number, now: number): void {
 export class SynthVoice {
   readonly instanceId: number
   readonly createdAt: number
-  readonly allocatedAt: number
-  readonly startsAt: number
+  private allocatedClock: number
+  private startClock = Infinity
+  private armed = false
+  private startupReversal = true
+  private readyPromise: Promise<void>
+  private resolveReady!: () => void
+  private rejectReady!: (reason: unknown) => void
   readonly note: VoiceNote
   private gate = true
   private scheduledEnd: number | null = null
@@ -38,6 +47,9 @@ export class SynthVoice {
   retiring = false
   private params: SynthParams
   private envelope: GainNode
+  private envelopeControl!: EnvelopeLease
+  private envelopeRevision = 0
+  private envelopeAcknowledgement: EnvelopeProcessorState | null = null
   private velocityGain: GainNode
   private carrier: Carrier | null = null
   private retiringCarrier: Carrier | null = null
@@ -69,39 +81,86 @@ export class SynthVoice {
     this.params = copyParams(params)
     this.instanceId = instanceId
     this.pitchBend = pitchBend
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve
+      this.rejectReady = reject
+    })
     const now = context.currentTime
     this.createdAt = now
+    this.allocatedClock = now
     this.frequencyRamp = { start: now, end: now, from: note.frequency, to: note.frequency }
     this.envelope = context.createGain()
     this.velocityGain = context.createGain()
+    // The native gain timeline never changes while the voice is running.
+    // Its audio-rate input supplies the complete musical envelope instead.
     this.envelope.gain.value = 0
-    this.envelope.gain.setValueAtTime(0, now)
     this.velocityGain.gain.value = note.velocity / 127
     this.envelope.connect(this.velocityGain)
     this.velocityGain.connect(destination)
     const timbre = this.getTimbre()
     this.carrier = this.createCarrier(timbre, timbre.level, now, false)
-    // Read a fresh clock after node allocation. A live command needs one render
-    // quantum to reach the audio thread; already-future sequence times stay exact.
-    this.allocatedAt = context.currentTime
-    this.startsAt = timing && timing.startAt > this.allocatedAt ? timing.startAt : this.controlTime(this.allocatedAt)
+    // Future transport notes keep their exact synchronous bootstrap. A live
+    // note reserves a silent lane until this task's synchronous reversals finish.
+    const scheduledAt = context.currentTime
+    this.startClock = timing && timing.startAt > scheduledAt ? timing.startAt : this.controlTime(scheduledAt)
     this.scheduledEnd = timing ? Math.max(this.startsAt + 0.001, timing.endAt + this.startsAt - timing.startAt) : null
-    this.carrier.oscillator.start(this.startsAt)
-    this.attack(this.startsAt)
+    if (timing) {
+      this.attack(this.startsAt)
+      this.armed = true
+      this.startupReversal = false
+    }
+    this.envelopeControl = createEnvelopeControl(context, instanceId, timing ? {
+      type: 'plan', revision: this.envelopeRevision, at: this.startsAt, ramps: this.envelopeRamps,
+    } : undefined)
+    this.envelopeControl.port.onmessage = (event: MessageEvent<EnvelopeProcessorState>) => {
+      const state = event.data
+      if (this.destroyed || state?.type !== 'state' || state.instanceId !== this.instanceId) return
+      // A delayed acknowledgement from the previous plan cannot authorize
+      // cleanup after a retrigger, live ADSR edit or shortened forced release.
+      if (state.slot !== this.envelopeControl.slot || state.generation !== this.envelopeControl.generation
+        || state.revision !== this.envelopeRevision) return
+      this.envelopeAcknowledgement = state
+    }
+    this.envelopeControl.connect(this.envelope.gain)
+    this.allocatedClock = context.currentTime
+    if (timing) {
+      this.carrier.oscillator.start(this.startsAt)
+      this.resolveReady()
+    } else {
+      // No attack or source start is sent before this microtask: even if audio
+      // advances during a busy synchronous caller, ON/OFF cannot leak an attack.
+      queueMicrotask(() => {
+        this.startupReversal = false
+        try { this.commitStartup() } catch (error) {
+          this.rejectReady(error)
+          this.destroy()
+        }
+      })
+    }
   }
+
+  get startsAt(): number { return this.startClock }
+  get allocatedAt(): number { return this.allocatedClock }
+  ready(): Promise<void> { return this.readyPromise }
 
   get gateOpen(): boolean {
     return this.gateAt(this.context.currentTime)
   }
 
-  get awaitingStart(): boolean { return !this.destroyed && this.context.currentTime < this.startsAt }
+  get awaitingStart(): boolean { return !this.destroyed && this.beforeStart(this.context.currentTime) }
   get plannedEndAt(): number | null { return this.scheduledEnd }
+
+  /** A clock snapshot near onset can trail audio already being rendered. */
+  canCancelBeforeStart(now = this.context.currentTime): boolean {
+    return !this.destroyed && this.startFrame() - this.sampleFrame(now) >= CONTROL_LEAD_FRAMES
+  }
 
   setParams(params: SynthParams, now: number): void {
     if (this.destroyed) return
     const previous = this.params
     this.params = copyParams(params)
     if (this.note.origin === 'audition' && this.note.frequency !== params.frequency) this.setFrequency(params.frequency, now)
+    if (!this.armed) return // Apply the latest ADSR and timbre once, when armed.
     const adsrChanged = (Object.keys(params.adsr) as Array<keyof SynthParams['adsr']>)
       .some(key => previous.adsr[key] !== params.adsr[key])
     if (adsrChanged) this.updateEnvelope(previous, this.controlTime(this.context.currentTime))
@@ -123,32 +182,51 @@ export class SynthVoice {
     this.releasingAt = null
     this.releaseEnds = Infinity
     this.fixedRelease = false
+    if (!this.armed) return
     this.attack(Math.max(this.startsAt, this.controlTime(this.context.currentTime)))
   }
 
   release(seconds?: number, force = false): void {
     if (this.destroyed) return
     const currentTime = this.context.currentTime
-    // A native start already in the lookahead queue must be cancelled, even
-    // though its audible gate has not opened yet.
-    if (currentTime < this.startsAt) { this.destroy(); return }
+    if (this.context.state !== 'running') { this.destroy(); return }
+    const sameTaskReversal = this.note.origin !== 'sequence' && this.startupReversal
+    if (sameTaskReversal || (this.note.origin === 'sequence' && this.beforeStart(currentTime))) {
+      // Only distant queued starts are provably safe to disconnect. Close to
+      // onset, replace the future attack atomically and wait for rendered zero;
+      // a late command joins any already-rendering samples via the processor.
+      if (!sameTaskReversal && this.canCancelBeforeStart(currentTime)) { this.destroy(); return }
+      const now = this.sampleFrame(currentTime) / this.context.sampleRate
+      this.gate = false
+      this.scheduledEnd = null
+      this.releasingAt = now
+      this.fixedRelease = true
+      this.releaseEnds = now + MIN_ENVELOPE_SECONDS
+      this.scheduleEnvelope([{ start: now, end: this.releaseEnds, from: 0, to: 0, phase: 'release' }], now)
+      return
+    }
     if (!this.gateOpen && !force) return
-    const now = this.controlTime(currentTime)
-    const value = this.envelopeValue(now)
+    const now = this.controlTime(this.context.currentTime)
+    const silentStart = this.sampleFrame(now) <= this.startFrame()
+    const value = silentStart ? 0 : this.envelopeValue(now)
     const previousEnd = !this.gateOpen && this.fixedRelease ? this.releaseEnds : Infinity
     if (previousEnd <= now) return // An existing technical tail reaches zero sooner.
     this.gate = false
     this.scheduledEnd = null
     this.releasingAt = Math.min(this.releasingAt ?? now, now)
     this.fixedRelease ||= force || seconds !== undefined
-    this.releaseEnds = Math.min(previousEnd, now + Math.max(MIN_ENVELOPE_SECONDS, seconds ?? this.params.adsr.release))
+    // Cancelling at the very start has no energy to release. Its zero-only
+    // technical tail still needs a native ACK, without retaining a silent slot
+    // for the preset's full musical Release.
+    const duration = silentStart ? MIN_ENVELOPE_SECONDS : Math.max(MIN_ENVELOPE_SECONDS, seconds ?? this.params.adsr.release)
+    this.releaseEnds = Math.min(previousEnd, now + duration)
     this.scheduleEnvelope([{ start: now, end: this.releaseEnds, from: value, to: 0, phase: 'release' }], now)
   }
 
   /** Audio time, rather than wall time, decides when a suspended tail finishes. */
   maintain(now: number): boolean {
     if (this.destroyed) return true
-    if (!this.gateOpen && now >= this.releaseEnds + 0.005) {
+    if (!this.gateOpen && now >= this.releaseEnds + 0.005 && this.getEnvelopeControlState().safeToDestroy) {
       this.destroy()
       return true
     }
@@ -157,7 +235,40 @@ export class SynthVoice {
   }
 
   nextMaintenanceAt(): number {
-    return Math.min(this.releaseEnds + 0.005, this.retiringCarrier ? this.waveformFadeEnds : Infinity)
+    const releaseAt = this.releaseEnds + 0.005
+    // If a busy main thread has not delivered the zero ACK yet, poll at most
+    // once per five milliseconds instead of rescheduling an expired deadline.
+    const cleanupAt = releaseAt <= this.context.currentTime && !this.getEnvelopeControlState().safeToDestroy
+      ? this.context.currentTime + 0.005 : releaseAt
+    return Math.min(cleanupAt, this.retiringCarrier ? this.waveformFadeEnds : Infinity)
+  }
+
+  getEnvelopeControlState() {
+    const acknowledgement = this.envelopeAcknowledgement
+    const zero = acknowledgement?.revision === this.envelopeRevision && acknowledgement.zeroFrame !== null
+    const notStarted = !this.armed || this.beforeStart(this.context.currentTime)
+    const cancelSafeBeforeStart = this.canCancelBeforeStart()
+    return {
+      instanceId: this.instanceId,
+      slot: this.envelopeControl.slot,
+      generation: this.envelopeControl.generation,
+      revision: this.envelopeRevision,
+      acknowledgedRevision: acknowledgement?.revision ?? null,
+      appliedFrame: acknowledgement?.appliedFrame ?? null,
+      renderedThroughFrame: acknowledgement?.renderedThroughFrame ?? null,
+      endFrame: acknowledgement?.endFrame ?? null,
+      zeroFrame: acknowledgement?.zeroFrame ?? null,
+      readyFrame: acknowledgement?.readyFrame ?? null,
+      firstProcessFrame: acknowledgement?.firstProcessFrame ?? null,
+      zero,
+      connected: !this.destroyed,
+      destroyed: this.destroyed,
+      notStarted,
+      startupReversalOpen: this.startupReversal && !this.destroyed,
+      cancelSafeBeforeStart,
+      contextState: this.context.state,
+      safeToDestroy: this.destroyed || cancelSafeBeforeStart || this.context.state !== 'running' || zero,
+    }
   }
 
   getSnapshot(now: number): VoiceSnapshot {
@@ -194,8 +305,34 @@ export class SynthVoice {
     this.carrier = null
     this.retiringCarrier = null
     this.envelope.disconnect()
+    this.envelopeControl.port.postMessage({ type: 'dispose-lane' })
+    this.envelopeControl.disconnect()
+    this.envelopeControl.port.onmessage = null
+    this.envelopeControl.port.close()
     this.velocityGain.disconnect()
     this.envelopeRamps = []
+    this.resolveReady()
+  }
+
+  private commitStartup(): void {
+    if (this.destroyed || !this.gate) { this.resolveReady(); return }
+    if (this.context.state !== 'running') { this.destroy(); return }
+    const carrier = this.carrier!
+    const timbre = this.getTimbre()
+    if (timbre.coefficients) carrier.oscillator.setPeriodicWave(this.waveCache.get(timbre.coefficients))
+    else carrier.oscillator.type = timbre.waveform
+    carrier.waveform = timbre.waveform
+    carrier.mode = timbre.mode
+    carrier.key = timbre.key
+    carrier.level = timbre.level
+    const now = this.context.currentTime
+    carrier.gain.gain.setValueAtTime(timbre.level, now)
+    this.allocatedClock = now
+    this.startClock = this.controlTime(now)
+    this.armed = true
+    this.attack(this.startsAt)
+    carrier.oscillator.start(this.startsAt)
+    this.resolveReady()
   }
 
   private setFrequency(frequency: number, now: number): void {
@@ -241,7 +378,7 @@ export class SynthVoice {
   }
 
   private requestWaveform(now: number): void {
-    if (this.destroyed || !this.carrier) return
+    if (this.destroyed || !this.armed || !this.carrier) return
     if (this.retiringCarrier) {
       if (now < this.waveformFadeEnds) return // Coalesce rapid controls; never create a third carrier.
       this.destroyCarrier(this.retiringCarrier)
@@ -290,7 +427,7 @@ export class SynthVoice {
   }
 
   private envelopePhase(now: number): EnvelopePhase {
-    if (now < this.startsAt) return 'idle'
+    if (!this.armed || this.beforeStart(now)) return 'idle'
     for (const ramp of this.envelopeRamps) {
       if (now < ramp.start) return this.envelopeValue(now) > 0 ? 'sustain' : 'idle'
       if (now < ramp.end) return ramp.phase
@@ -301,7 +438,6 @@ export class SynthVoice {
   private scheduleEnvelope(ramps: EnvelopeRamp[], now: number): void {
     const value = this.envelopeValue(now)
     const previous = this.envelopeRamps
-    const activeRamp = previous.some(ramp => now >= ramp.start && now < ramp.end)
     if (this.scheduledEnd !== null && now < this.scheduledEnd) {
       const endAt = this.scheduledEnd
       const held: EnvelopeRamp[] = []
@@ -317,25 +453,22 @@ export class SynthVoice {
       this.releaseEnds = endAt + Math.max(MIN_ENVELOPE_SECONDS, this.params.adsr.release)
       ramps = [...held, { start: endAt, end: this.releaseEnds, from: endValue, to: 0, phase: 'release' }]
     }
-    const param = this.envelope.gain
-    param.cancelScheduledValues(now)
-    // Reconstruct the active ramp's endpoint from our exact linear model.
-    // A native cancelAndHold may leave a deferred hold unresolved when a live
-    // update reaches the render thread late. SetValue would instead erase the
-    // interpolation leading up to this future anchor, so use it only at rest.
-    if (activeRamp) param.linearRampToValueAtTime(value, now)
-    else param.setValueAtTime(value, now)
-    let previousEnd = now
-    for (const ramp of ramps) {
-      // Sustain is a gap between native ramps, not a ramp to the next Off.
-      if (ramp.start > previousEnd) param.setValueAtTime(ramp.from, ramp.start)
-      param.linearRampToValueAtTime(ramp.to, ramp.end)
-      previousEnd = ramp.end
-    }
     const currentTime = this.context.currentTime
     const prefix = previous.filter(ramp => ramp.end > currentTime && ramp.start < now)
-      .map(ramp => ({ ...ramp, end: Math.min(ramp.end, now), to: rampValue(ramp, Math.min(ramp.end, now)) }))
+      .map(ramp => {
+        const start = Math.max(ramp.start, currentTime)
+        const end = Math.min(ramp.end, now)
+        return { ...ramp, start, end, from: rampValue(ramp, start), to: rampValue(ramp, end) }
+      }).filter(ramp => ramp.end > ramp.start)
     this.envelopeRamps = [...prefix, ...ramps]
+    this.envelopeAcknowledgement = null
+    const revision = ++this.envelopeRevision
+    // Transport bootstraps use the claim; live startup and later edits use the
+    // same port of the already processing shared control.
+    if (this.envelopeControl) this.envelopeControl.port.postMessage({
+      type: 'plan', revision, at: now,
+      ramps: this.envelopeRamps,
+    })
   }
 
   private attack(now: number): void {
@@ -348,7 +481,7 @@ export class SynthVoice {
   }
 
   private updateEnvelope(previous: SynthParams, now: number): void {
-    if (now < this.startsAt) { this.attack(this.startsAt); return }
+    if (this.beforeStart(now)) { this.attack(this.startsAt); return }
     const value = this.envelopeValue(now)
     const phase = this.envelopePhase(now)
     const current = this.envelopeRamps.find(ramp => now < ramp.end)
@@ -374,9 +507,15 @@ export class SynthVoice {
   }
 
   private gateAt(now: number): boolean {
-    return this.gate && !this.destroyed && (this.note.origin !== 'sequence' || now >= this.startsAt)
+    return this.gate && !this.destroyed && (this.note.origin !== 'sequence' || !this.beforeStart(now))
       && (this.scheduledEnd === null || now < this.scheduledEnd)
   }
 
-  private controlTime(now: number): number { return now + CONTROL_LEAD_FRAMES / this.context.sampleRate }
+  private sampleFrame(time: number): number { return Math.round(time * this.context.sampleRate) }
+  private startFrame(): number { return Math.ceil(this.startsAt * this.context.sampleRate - 1e-7) }
+  private beforeStart(now: number): boolean { return this.sampleFrame(now) < this.startFrame() }
+  private controlTime(now: number): number {
+    return (this.sampleFrame(now) + CONTROL_LEAD_FRAMES) / this.context.sampleRate
+  }
+
 }

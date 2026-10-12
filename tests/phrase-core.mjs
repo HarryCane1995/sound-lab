@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 
-const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
+const browserName = testBrowserName()
 const session = await startTestBrowser()
 try {
   const report = await session.page.evaluate(async () => {
     const { PhraseCapture, quantizeNotes, playbackDuration, copyPhrase, phraseId } = await import('/src/phrases/model.ts')
-    const { validatePhrase, exportPhraseJson, importPhraseJson, listPhrases, savePhrase, deletePhrase, saveDraft, loadDraft, PHRASE_DB, MAX_IMPORT_BYTES } = await import('/src/phrases/storage.ts')
+    const { validatePhrase, exportPhraseJson, importPhraseJson, exportLibraryJson, importLibraryJson, restoreLibrary, phraseHasUnsavedChanges, validateSoundSnapshot, listPhrases, savePhrase, deletePhrase, saveDraft, loadDraft, PHRASE_DB, MAX_IMPORT_BYTES, MAX_LIBRARY_IMPORT_BYTES } = await import('/src/phrases/storage.ts')
     const { exportMidi } = await import('/src/phrases/midiExport.ts')
     const { DEFAULT_PARAMS, copyParams } = await import('/src/types.ts')
     const results = []
@@ -45,6 +45,101 @@ try {
       ['source cleanup leaves the local keyboard held until Stop', recorded.notes[2].end === 0.7],
       ['snapshot and caller edits cannot mutate captured notes or sound', recorded.notes[0].velocity === 100 && recorded.sound.adsr.sustain === DEFAULT_PARAMS.adsr.sustain && recorded.sound.additive.levels[0] === 100],
       ['Stop closes recording and produces a validated phrase', !capture.recording && validatePhrase(recorded).duration === 0.7],
+    ])
+
+    let deliveredAt = 1000
+    const delayedCapture = new PhraseCapture(() => deliveredAt)
+    delayedCapture.start(120, 'free')
+    deliveredAt = 1700; delayedCapture.noteOn(note('delayed:first'), 1150)
+    deliveredAt = 1800; delayedCapture.noteOn(note('delayed:second', 64, { velocity: 75 }), 1200)
+    deliveredAt = 1900; delayedCapture.noteOff('delayed:first', 1400)
+    deliveredAt = 2200; delayedCapture.noteOff('delayed:second', 1600)
+    const delayed = delayedCapture.stop()
+    check('Delayed event delivery preserves original monotonic musical timestamps', { notes: delayed.notes }, [
+      ['first note uses event time rather than processing time', delayed.notes[0].start === 0.15 && delayed.notes[0].end === 0.4],
+      ['overlapping second note retains its exact original interval and velocity', delayed.notes[1].start === 0.2 && delayed.notes[1].end === 0.6 && delayed.notes[1].velocity === 75],
+      ['independent source event identities remain paired', delayed.notes.map(entry => entry.eventId).join(',') === 'delayed:first,delayed:second' && validatePhrase(delayed).notes.length === 2],
+    ])
+    deliveredAt = 1000; delayedCapture.start(120, 'free', null, NaN)
+    deliveredAt = 1100; delayedCapture.noteOn(note('fallback'), NaN)
+    deliveredAt = 1300; delayedCapture.noteOff('fallback', Infinity)
+    deliveredAt = 1400; delayedCapture.noteOn(note('before-start'), 900)
+    delayedCapture.noteOff('before-start', 800)
+    deliveredAt = 1600
+    const fallbackTimes = delayedCapture.stop()
+    check('Invalid event timestamps fall back to the clock and preserve positive bounded intervals', { notes: fallbackTimes.notes }, [
+      ['non-finite start and note timestamps use the injected monotonic clock', fallbackTimes.notes[0].start === 0.1 && fallbackTimes.notes[0].end === 0.3],
+      ['events before recording clamp to zero with a positive minimum duration', fallbackTimes.notes[1].start === 0 && fallbackTimes.notes[1].end === 0.001],
+      ['fallback output remains a valid finite phrase', validatePhrase(fallbackTimes).notes.every(entry => Number.isFinite(entry.start) && Number.isFinite(entry.end))],
+    ])
+
+    // Mount the real hook with the same Vite-resolved React instance as the app.
+    // The engine is inert: this case verifies recording dispatch, not audio.
+    const mainModule = await (await fetch('/src/main.tsx')).text()
+    const reactUrl = mainModule.match(/from\s+["']([^"']*\/react\.js(?:\?[^"']*)?)["']/)?.[1]
+    const clientUrl = mainModule.match(/from\s+["']([^"']*\/react-dom_client\.js(?:\?[^"']*)?)["']/)?.[1]
+    if (!reactUrl || !clientUrl) throw new Error('Cannot resolve the application React modules for the Count-in hook test')
+    const reactModule = await import(reactUrl), clientModule = await import(clientUrl)
+    const React = reactModule.default ?? reactModule, { createRoot } = clientModule.default ?? clientModule
+    const { usePhraseRecorder } = await import('/src/phrases/usePhraseRecorder.ts')
+    const waitFor = async predicate => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        if (predicate()) return
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      throw new Error('Phrase hook state did not settle')
+    }
+    let controller = null, heldForHook = [], hookClock = 10_000
+    const hookEngine = { prepare: () => Promise.resolve(), getAudioClock: () => ({ time: 0, state: 'running', sampleRate: 48000 }), getVoices: () => [], cancelMetronome() {}, scheduleMetronome() {} }
+    const container = document.createElement('div'); container.hidden = true; document.body.appendChild(container)
+    const hookRoot = createRoot(container)
+    const originalNow = Object.getOwnPropertyDescriptor(performance, 'now')
+    const restoreClock = () => { if (originalNow) Object.defineProperty(performance, 'now', originalNow); else delete performance.now }
+    let hookTake = null, hookStatusAfterStop = null
+    try {
+      function CaptureHarness() {
+        controller = usePhraseRecorder({ engineRef: { current: hookEngine }, paramsRef: { current: copyParams(DEFAULT_PARAMS) }, applyParams() {}, getHeld: () => heldForHook })
+        return null
+      }
+      hookRoot.render(React.createElement(CaptureHarness))
+      await waitFor(() => controller !== null)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      await waitFor(() => !controller.dataBusy)
+      controller.setRecordingMode('tempo'); controller.setCountIn(true)
+      await waitFor(() => controller.recordingMode === 'tempo' && controller.countIn)
+      Object.defineProperty(performance, 'now', { configurable: true, value: () => hookClock })
+      controller.record()
+      // prepare() arms Count-in in this microtask using the original 10000ms.
+      await Promise.resolve()
+      const triggering = note('count-in:trigger', 67)
+      heldForHook = [note('count-in:already-held', 60), triggering]
+      hookClock = 12_100
+      // The event happened 30ms after the 12020ms boundary, but delivery took50ms.
+      controller.onNoteOn(triggering, 12_050)
+      controller.onNoteOn(note('count-in:fallback', 72), NaN)
+      hookClock = 12_220
+      controller.onNoteOff(triggering.id, 12_130)
+      controller.onNoteOff('count-in:already-held', 12_140)
+      controller.onNoteOff('count-in:fallback', Infinity)
+      controller.stop()
+      restoreClock()
+      await waitFor(() => controller.draft?.notes.length === 3)
+      await waitFor(() => !controller.dataBusy)
+      hookTake = copyPhrase(controller.draft)
+      hookStatusAfterStop = controller.status
+    } finally {
+      restoreClock(); hookRoot.unmount(); container.remove()
+      await saveDraft(null)
+    }
+    const triggered = hookTake.notes.find(entry => entry.eventId === 'count-in:trigger')
+    const seeded = hookTake.notes.find(entry => entry.eventId === 'count-in:already-held')
+    const invalidHookTime = hookTake.notes.find(entry => entry.eventId === 'count-in:fallback')
+    check('Real recording hook preserves a delayed Count-in triggering note without duplicate seeding', { notes: hookTake.notes, statusAfterStop: hookStatusAfterStop }, [
+      ['trigger note is captured once using its supplied onset and release times', hookTake.notes.filter(entry => entry.eventId === 'count-in:trigger').length === 1 && triggered.start === 0.03 && triggered.end === 0.11],
+      ['previously held note retains existing Count-in seed timing', seeded.start === 0.08 && seeded.end === 0.12],
+      ['hook validates non-finite timestamps before forwarding to capture', invalidHookTime.start === 0.08 && invalidHookTime.end === 0.2],
+      ['count-in keeps the configured tempo mode and a valid sound snapshot', hookTake.recordingMode === 'tempo' && hookTake.bpm === 120 && validatePhrase(hookTake).sound !== null],
+      ['same-task Stop prevents deferred Count-in UI from restoring Recording', hookStatusAfterStop === 'stopped'],
     ])
     capture.start(90, 'tempo')
     clock += 100
@@ -207,6 +302,53 @@ try {
       ['draft sound and notes survive and can then be removed', same(draft.notes, renamed.notes) && same(draft.sound, renamed.sound) && await loadDraft() === null],
       ['phrase library never writes into localStorage', JSON.stringify(Object.entries(localStorage)) === beforeLocalStorage],
     ])
+    const additiveCopy = { ...copyPhrase(renamed), id: phraseId(), name: 'Additive backup', sound: snapshotSoundForTest() }
+    function snapshotSoundForTest() { const value = copyParams(DEFAULT_PARAMS); value.mode = 'additive'; value.additive.levels[1] = 46; value.additive.phases[2] = 180; return value }
+    const libraryJson = exportLibraryJson([renamed, additiveCopy], additiveCopy)
+    const backup = importLibraryJson(libraryJson)
+    const restored = await restoreLibrary(backup)
+    const restoredRead = await listPhrases(), restoredDraft = await loadDraft()
+    check('Versioned whole-library backup restores real IndexedDB with additive identities and snapshots', { exported: backup.phrases.length, restored: restored.phrases.length, total: restoredRead.phrases.length }, [
+      ['all phrase music and Classic / Additive snapshots survive export', same(backup.phrases, [renamed, additiveCopy]) && same(backup.draft, additiveCopy)],
+      ['all restored phrase identities are fresh and pre-existing phrase remains exact', restored.phrases.every(value => ![renamed.id, additiveCopy.id].includes(value.id)) && same(restoredRead.phrases.find(value => value.id === renamed.id), renamed)],
+      ['draft points to the imported copy and preserves its music and sound', restoredDraft.id === restored.phrases[1].id && same(restoredDraft.notes, additiveCopy.notes) && same(restoredDraft.sound, additiveCopy.sound)],
+      ['restored entries never share mutable note or sound references with the parsed backup', restored.phrases[0].notes[0] !== backup.phrases[0].notes[0] && restored.phrases[1].sound.additive.levels !== backup.phrases[1].sound.additive.levels],
+      ['backup and restore do not modify MIDI or harmonic localStorage keys', JSON.stringify(Object.entries(localStorage)) === beforeLocalStorage],
+    ])
+    const secondRestore = await restoreLibrary(backup)
+    check('Repeated library import adds independent copies instead of overwriting stored music', { count: (await listPhrases()).phrases.length }, [
+      ['both imports and the original coexist with unique IDs', (await listPhrases()).phrases.length === 5 && new Set([...restored.phrases, ...secondRestore.phrases, renamed].map(value => value.id)).size === 5],
+    ])
+    for (const value of [...restored.phrases, ...secondRestore.phrases]) await deletePhrase(value.id)
+    await saveDraft(renamed)
+    const collisionId = crypto.randomUUID
+    let collisionError = ''
+    try { crypto.randomUUID = () => renamed.id; await restoreLibrary(backup) } catch (error) { collisionError = error.message } finally { crypto.randomUUID = collisionId }
+    check('Even an ID generator collision aborts the entire library transaction', { collisionError, count: (await listPhrases()).phrases.length }, [
+      ['existing library and draft survive the rejected add-only import', Boolean(collisionError) && (await listPhrases()).phrases.length === 1 && same(await loadDraft(), renamed)],
+    ])
+    const invalidLibraries = [
+      { ...backup, version: 2 }, { ...backup, format: 'arbitrary-code' }, { ...backup, phrases: [renamed, renamed] },
+      { ...backup, phrases: Array.from({ length: 201 }, (_, index) => ({ ...renamed, id: `bad:${index}` })) },
+      { ...backup, draft: { ...renamed, notes: [{ ...renamed.notes[0], velocity: 128 }] } },
+    ]
+    let librarySizeError = ''
+    try { importLibraryJson(' '.repeat(MAX_LIBRARY_IMPORT_BYTES + 1)) } catch (error) { librarySizeError = error.message }
+    check('Library validation rejects corruption duplicate IDs capacity and oversized input before storage changes', { invalid: invalidLibraries.length, librarySizeError }, [
+      ['version format duplicate identity count and invalid draft are all rejected', invalidLibraries.every(value => rejects(() => importLibraryJson(JSON.stringify(value))))],
+      ['byte limit is enforced before parsing a large file', librarySizeError.includes('64 MiB')],
+      ['rejected backup files leave stored library and draft untouched', (await listPhrases()).phrases.length === 1 && same(await loadDraft(), renamed)],
+    ])
+    check('Update safety detects meaningful draft changes including a typed name and optional sound', {}, [
+      ['a saved exact draft is safe even if metadata timestamps differ', !phraseHasUnsavedChanges({ ...renamed, updatedAt: renamed.updatedAt + 4 }, renamed, renamed.name)],
+      ['storage validation field ordering does not mark an unchanged saved take as dirty', !phraseHasUnsavedChanges(recorded, validatePhrase(recorded), recorded.name)],
+      ['a new unsaved take blocks updating', phraseHasUnsavedChanges(recorded, undefined)],
+      ['editing only the input name still blocks updating', phraseHasUnsavedChanges(renamed, renamed, 'Typed but not saved')],
+      ['changing music or the sound snapshot blocks updating', phraseHasUnsavedChanges({ ...renamed, notes: [{ ...renamed.notes[0], velocity: 20 }] }, renamed) && phraseHasUnsavedChanges({ ...renamed, sound: null }, renamed)],
+      ['empty unnamed draft is safe while a pending title is retained', !phraseHasUnsavedChanges(null, undefined) && phraseHasUnsavedChanges(null, undefined, 'Unfinished title')],
+      ['update snapshot validation makes independent safe copies and rejects invalid parameters', same(validateSoundSnapshot(additiveCopy.sound), additiveCopy.sound) && validateSoundSnapshot(additiveCopy.sound).additive.levels !== additiveCopy.sound.additive.levels && rejects(() => validateSoundSnapshot({ mode: 'unknown' }))],
+    ])
+    await saveDraft(null)
     const db = await new Promise((resolve, reject) => { const request = indexedDB.open(PHRASE_DB, 1); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error) })
     await new Promise((resolve, reject) => { const tx = db.transaction('phrases', 'readwrite'); tx.objectStore('phrases').put({ id: 'corrupt-entry', version: -1 }); tx.oncomplete = resolve; tx.onerror = () => reject(tx.error) })
     const corruptRead = await listPhrases()
@@ -223,6 +365,13 @@ try {
       ['the two-hundred-first phrase is rejected with a useful limit error', capacityError.includes('200')],
       ['existing entry can be edited even at capacity', fullLibrary.phrases.some(value => value.id === recorded.id && value.name === 'Edit at capacity')],
       ['deleting one entry permits a replacement without exceeding two hundred', fullLibrary.phrases.length === 200 && fullLibrary.phrases.some(value => value.id === 'replacement')],
+    ])
+    await saveDraft(renamed)
+    let libraryCapacityError = ''
+    try { await restoreLibrary(backup) } catch (error) { libraryCapacityError = error.message }
+    check('Whole-library restore capacity failure is atomic for both phrases and the current draft', { libraryCapacityError }, [
+      ['useful capacity error leaves all existing phrase entries unchanged', libraryCapacityError.includes('200') && same((await listPhrases()).phrases, fullLibrary.phrases)],
+      ['an import that cannot fit never replaces the existing draft', same(await loadDraft(), renamed)],
     ])
     db.close()
     return { results, failures: results.flatMap(result => result.checks.filter(assertion => !assertion.passed).map(assertion => `${result.name}: ${assertion.description}`)) }

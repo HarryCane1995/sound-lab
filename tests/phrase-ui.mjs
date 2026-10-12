@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFile, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 
 const session = await startTestBrowser(), { page } = session
 const results = [], errors = []
@@ -358,7 +358,7 @@ try {
   await button('Play phrase').click(); await status('Воспроизведение'); await button('Stop phrase').click()
   pass('Denied IndexedDB reports a visible error while in-memory recording and playback remain usable')
   assert.deepEqual(errors, [])
-  const browser = process.env.SOUND_LAB_BROWSER?.toLowerCase().includes('edge') ? 'edge' : 'chrome'
+  const browser = testBrowserName()
   await writeFile(`test-results/phrase-ui-${browser}.json`, JSON.stringify({ browser, results, errors }, null, 2))
   console.log(`PASS Phrase UI — ${results.length} groups`)
 } finally { await session.close() }

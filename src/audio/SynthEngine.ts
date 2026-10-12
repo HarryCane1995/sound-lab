@@ -4,6 +4,7 @@ import { MAX_RETIRING_VOICES, MAX_VOICES, VoiceManager, voiceMatches } from './V
 import type { VoiceNote, VoiceScope, VoiceSnapshot } from './voiceTypes'
 import { getClassicComparisonGain, getHarmonicCoefficients, getHarmonicScale } from '../harmonics/model'
 import { clearPeriodicWaveCache, getPeriodicWaveCache, PERIODIC_WAVE_CACHE_LIMIT, type PeriodicWaveCache } from './PeriodicWaveCache'
+import { disposeEnvelopeWorklet, ensureEnvelopeWorklet, envelopeWorkletReady, getEnvelopeServiceDiagnostics } from './EnvelopeControl'
 
 const MIN_FREQUENCY = 440 * 2 ** ((0 - 69) / 12)
 const MIX_HEADROOM = 0.25
@@ -140,7 +141,7 @@ export class SynthEngine {
   /** Native ON and Off automation. False lets the lookahead scheduler retry. */
   scheduleNote(note: VoiceNote, startAt: number, endAt: number): boolean {
     const context = this.context
-    if (this.disposed || !context || !this.graph || context.state !== 'running'
+    if (this.disposed || !context || !this.graph || context.state !== 'running' || !envelopeWorkletReady(context)
       || !Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) return false
     if (this.intents.has(note.id)) return true
     const velocity = bounded(note.velocity, 0, 127, 127)
@@ -259,7 +260,7 @@ export class SynthEngine {
           this.intents.delete(note.id)
           return
         }
-        if (context.state !== 'running') {
+        if (context.state !== 'running' || !envelopeWorkletReady(context)) {
           await this.resumeContext(context)
           continue
         }
@@ -276,7 +277,15 @@ export class SynthEngine {
       this.voices.add(voice)
       this.lastVelocity = velocity
       this.scheduleMaintenance()
+      // The shared service is already warm. Only the live startup microtask is
+      // awaited, so a synchronous ON/OFF reversal cannot dispatch an attack.
+      await voice.ready()
+      this.maintain(context.currentTime)
+      this.wakeCapacity()
+      this.scheduleMaintenance()
     } catch (error) {
+      if (this.context) this.maintain(this.context.currentTime)
+      this.wakeCapacity()
       if (!this.disposed && this.intents.get(note.id) === request) {
         this.intents.delete(note.id)
         throw error
@@ -395,6 +404,7 @@ export class SynthEngine {
     const waveform: Waveform = latestVoice?.getWaveform() ?? this.params.waveform
     const totalCarrierCount = snapshots.reduce((sum, voice) => sum + voice.carrierCount, 0)
     const velocity = latest?.velocity ?? this.lastVelocity
+    const envelopeControls = this.voices.all.map(voice => voice.getEnvelopeControlState())
     return {
       carrierCount: totalCarrierCount, totalCarrierCount,
       envelope: latest?.envelope ?? 0,
@@ -417,6 +427,10 @@ export class SynthEngine {
       scheduledFutureCount: [...this.scheduled.values()].filter(note => note.startAt > (this.context?.currentTime ?? 0)).length,
       metronomeCount: this.metronome.size, maxMetronomeTicks: METRONOME_LIMIT,
       maxVoices: MAX_VOICES, maxRetiringVoices: MAX_RETIRING_VOICES,
+      envelopeControlCount: envelopeControls.filter(control => control.connected).length,
+      maxEnvelopeControls: MAX_VOICES + MAX_RETIRING_VOICES,
+      ...getEnvelopeServiceDiagnostics(this.context),
+      envelopeControls,
       controlLeadFrames: CONTROL_LEAD_FRAMES,
       controlLeadSeconds: CONTROL_LEAD_FRAMES / (this.context?.sampleRate ?? 48000),
       mixHeadroom: MIX_HEADROOM,
@@ -449,11 +463,17 @@ export class SynthEngine {
       // escape if the browser has stopped advancing its audio clock.
       const cleanupAt = context.currentTime + CONTROL_LEAD_FRAMES / context.sampleRate + 0.025 + 0.005
       const wallDeadline = performance.now() + 250
-      while (context.state === 'running' && context.currentTime < cleanupAt && performance.now() < wallDeadline) {
+      const controlsSilent = () => this.voices.all.every(voice => voice.getEnvelopeControlState().safeToDestroy)
+      while (context.state === 'running' && (context.currentTime < cleanupAt || !controlsSilent()) && performance.now() < wallDeadline) {
         await new Promise<void>(resolve => setTimeout(resolve, Math.min(10, Math.max(1, (cleanupAt - context.currentTime) * 1000))))
       }
+      // A stopped audio clock or missing render ACK must not turn the bounded
+      // dispose escape into a hard cut of an active voice. Suspend first, then
+      // discard the silent graph; a later resume is impossible after dispose.
+      if (context.state === 'running' && !controlsSilent()) await context.suspend()
       context.removeEventListener('statechange', this.onContextStateChange)
       this.voices.destroyAll()
+      disposeEnvelopeWorklet(context)
       for (const tick of this.metronome) this.destroyTick(tick)
       this.emitContextState('closed')
       this.contextListeners.clear()
@@ -579,8 +599,14 @@ export class SynthEngine {
   }
 
   private async resumeContext(context: AudioContext): Promise<void> {
-    if (context.state === 'running' || context.state === 'closed') return
-    const resume = this.resumePromise ?? context.resume()
+    if (context.state === 'closed' || (context.state === 'running' && envelopeWorkletReady(context))) return
+    // Call resume in the gesture's synchronous turn; loading the shared module
+    // may be asynchronous. Pending notes recheck their cancellation tokens after
+    // both operations, so Panic/Note Off/dispose cannot reopen a cancelled gate.
+    const resume = this.resumePromise ?? Promise.all([
+      context.state === 'running' ? Promise.resolve() : context.resume(),
+      ensureEnvelopeWorklet(context, () => { this.panic() }),
+    ]).then(() => {})
     this.resumePromise = resume
     try { await resume }
     finally { if (this.resumePromise === resume) this.resumePromise = null }

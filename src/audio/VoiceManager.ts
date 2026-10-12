@@ -29,7 +29,7 @@ export class VoiceManager {
     // A saturated burst waits for a tail to reach zero. Hard truncation here
     // would introduce a discontinuity even though oscillator counts are bounded.
     if (this.retiring.size >= MAX_RETIRING_VOICES) {
-      const future = [...this.managed.values()].find(voice => voice.note.origin === 'sequence' && voice.awaitingStart)
+      const future = [...this.managed.values()].find(voice => voice.note.origin === 'sequence' && voice.canCancelBeforeStart())
       if (!future) return false
       this.managed.delete(future.instanceId)
       if (this.held.get(future.note.id) === future) this.held.delete(future.note.id)
@@ -98,10 +98,9 @@ export class VoiceManager {
     })[0]
     this.managed.delete(candidate.instanceId)
     if (this.held.get(candidate.note.id) === candidate) this.held.delete(candidate.note.id)
-    const wasAwaitingStart = candidate.awaitingStart
     candidate.retiring = true
     candidate.release(STEAL_FADE_SECONDS, true)
-    if (wasAwaitingStart) ++this.destroyedCount
+    if (candidate.getEnvelopeControlState().destroyed) ++this.destroyedCount
     else this.retiring.set(candidate.instanceId, candidate)
   }
 }

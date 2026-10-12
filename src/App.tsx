@@ -22,9 +22,12 @@ import { MidiLearnButton, MidiLearnProvider } from './midi/MidiLearnContext'
 import { MidiPanel } from './components/MidiPanel'
 import { PhraseRecorder } from './components/PhraseRecorder'
 import { usePhraseRecorder, type PhraseController } from './phrases/usePhraseRecorder'
+import { PwaPanel } from './pwa/PwaPanel'
+import { preserveUpdateSound, restoreUpdateSound } from './pwa/soundState'
 import './midi/midi.css'
 
 const midiSource = (id: string) => `midi:${JSON.stringify(id)}`
+const updateSound = restoreUpdateSound()
 
 const WAVES: { id: Waveform; name: string; english: string; hint: string }[] = [
   { id: 'sine', name: 'Синусоида', english: 'Sine', hint: 'Чистый основной тон, практически без дополнительных гармоник.' },
@@ -35,7 +38,7 @@ const WAVES: { id: Waveform; name: string; english: string; hint: string }[] = [
 
 export default function App() {
   const [initialHarmonics] = useState(() => loadHarmonicState())
-  const [params, setParams] = useState<SynthParams>(() => copyParams({ ...DEFAULT_PARAMS,
+  const [params, setParams] = useState<SynthParams>(() => copyParams(updateSound ?? { ...DEFAULT_PARAMS,
     mode: initialHarmonics.state?.mode ?? 'classic', additive: initialHarmonics.state?.additive ?? DEFAULT_PARAMS.additive }))
   const [patchStatus, setPatchStatus] = useState(initialHarmonics.error ?? 'Режим и гармоники сохраняются автоматически. Solo и Compare действуют только в этой сессии.')
   const paramsRef = useRef(params)
@@ -167,14 +170,14 @@ export default function App() {
   }, [refreshAudio, syncHeld])
 
   const pressHeldNote = useCallback((note: HeldNote) => {
+    const inputAt = performance.now()
     if (!held.current.press(note)) return
-    phraseRef.current?.onNoteOn({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId })
-    syncHeld(); setError(null)
-    if (note.origin === 'midi') setVelocity(note.velocity)
     const engine = engineRef.current
     if (!engine) { held.current.release(note.id); syncHeld(); return }
     const token = ++requestSerial.current
     noteRequests.current.set(note.id, token)
+    // Queue the audio commit before React's render microtask. Recording keeps
+    // the input timestamp even if UI work takes time after this call.
     // Note frequencies belong to their voices, never to the manual Frequency control.
     void engine.noteOnVoice({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId, frequency: midiFrequency(note.midi) }).then(() => {
       if (engineRef.current === engine) refreshAudio()
@@ -183,7 +186,14 @@ export default function App() {
       noteRequests.current.delete(note.id); held.current.release(note.id); phraseRef.current?.onNoteOff(note.id); syncHeld()
       engine.noteOffVoice(note.id, true); audioError(reason); refreshAudio()
     })
-    refreshAudio()
+    phraseRef.current?.onNoteOn({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId }, inputAt)
+    // A chord can dispatch several inputs in one task. Defer state setters
+    // too, so the first key's React flush cannot precede later audio commits.
+    queueMicrotask(() => {
+      syncHeld(); setError(null)
+      if (note.origin === 'midi') setVelocity(note.velocity)
+      refreshAudio()
+    })
   }, [audioError, refreshAudio, syncHeld])
 
   const pressNote = useCallback((id: string, midi: number) => {
@@ -192,11 +202,12 @@ export default function App() {
   }, [pressHeldNote])
 
   const releaseNote = useCallback((id: string) => {
-    phraseRef.current?.onNoteOff(id)
-    noteRequests.current.delete(id)
-    held.current.release(id); syncHeld()
+    const inputAt = performance.now()
     engineRef.current?.noteOffVoice(id)
-    refreshAudio()
+    phraseRef.current?.onNoteOff(id, inputAt)
+    noteRequests.current.delete(id)
+    held.current.release(id)
+    queueMicrotask(() => { syncHeld(); refreshAudio() })
   }, [refreshAudio, syncHeld])
 
   const releaseLocalNotes = () => {
@@ -244,7 +255,7 @@ export default function App() {
       auditionRequested.current = false; auditionPending.current = false
       engine.noteOff(); refreshAudio(); return
     }
-    auditionRequested.current = true; auditionPending.current = true; setError(null)
+    auditionRequested.current = true; auditionPending.current = true
     const token = ++requestSerial.current
     noteRequests.current.set('audition', token)
     void engine.noteOn(paramsRef.current.frequency).then(() => {
@@ -254,7 +265,7 @@ export default function App() {
       if (engineRef.current !== engine || noteRequests.current.get('audition') !== token) return
       auditionPending.current = false; auditionRequested.current = false; audioError(reason); refreshAudio()
     })
-    refreshAudio()
+    queueMicrotask(() => { setError(null); refreshAudio() })
   }
 
   const loadParams = (next: SynthParams) => {
@@ -365,6 +376,23 @@ export default function App() {
   const phraseController = usePhraseRecorder({ engineRef, paramsRef, applyParams,
     getHeld: () => held.current.values.map(note => ({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId })) })
   phraseRef.current = phraseController
+  const updateSafety = useRef<() => string | null>(() => null)
+  updateSafety.current = () => {
+    const phrase = phraseRef.current
+    if (phrase?.status !== 'stopped' || phrase.preparing) return 'Остановите запись или воспроизведение перед обновлением.'
+    if (phrase.dataBusy) return 'Дождитесь завершения сохранения, импорта или экспорта.'
+    if (phrase.hasUnsavedChanges) return 'Сохраните изменения фразы или очистите черновик перед обновлением.'
+    if (midiRef.current?.getState().learning || midiRef.current?.getState().conflict) return 'Завершите MIDI Learn перед обновлением.'
+    const audio = engineRef.current?.getState()
+    if (audio?.audible || audio?.pendingCount || engineRef.current?.getVoices().length || held.current.size) return 'Отпустите клавиши и остановите звук перед обновлением.'
+    return null
+  }
+  const blockUpdate = useCallback(() => updateSafety.current(), [])
+  const prepareUpdate = useCallback(() => {
+    const error = saveHarmonicState(paramsRef.current)
+    if (error) throw new Error(error)
+    preserveUpdateSound(paramsRef.current)
+  }, [])
   const lfoFilterBypassed = params.lfo.enabled && params.lfo.target === 'filter' && params.filter.bypass
   const activeNotes = heldNotes.map(note => ({ id: note.id, midi: note.midi, sourceName: note.sourceName, channel: note.channel }))
   const activeMidis = [...new Set(heldNotes.map(note => note.midi))]
@@ -379,8 +407,9 @@ export default function App() {
   return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className="app-shell">
     <header className="app-header">
       <a className="brand" href="#main" aria-label="SOUND LAB — к лаборатории"><span className="brand-mark"><svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M4 18h5l4-11 8 22 6-17 3 6h3" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" /></svg></span><span>SOUND <strong>LAB</strong><small>Лаборатория звукового синтеза</small></span></a>
-      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">ЛОКАЛЬНО <span>v0.5</span></span></div>
+      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">{import.meta.env.DEV ? 'DEVELOPMENT' : 'PWA'} <span>v{__APP_VERSION__}</span></span></div>
     </header>
+    <PwaPanel blocked={blockUpdate} prepare={prepareUpdate} />
 
     <main id="main">
       <div className="page-heading"><div><span className="eyebrow">УСЛЫШАТЬ. УВИДЕТЬ. ПОНЯТЬ.</span><h1>Из чего состоит звук<span>?</span></h1><p>Меняйте один параметр. Слушайте разницу. Следите за сигналом.</p></div><div className="preset-toolbar"><label htmlFor="preset-select">ОТПРАВНАЯ ТОЧКА <Hint text="Пресет — готовый набор параметров. Загрузка останавливает все голоса. Сыграйте новые ноты или нажмите Play, чтобы услышать пресет." /></label><div><select id="preset-select" value={presetId} onChange={event => {
@@ -437,6 +466,6 @@ export default function App() {
         {error && <div className="error-message" role="alert">{error}</div>}
       </div><LessonPanel onLoad={loadLesson} loadedLesson={loadedLesson} /></div>
     </main>
-    <footer className="app-footer"><span>SOUND LAB <span>0.5</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
+    <footer className="app-footer"><span>SOUND LAB <span>{__APP_VERSION__}</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
   </div></MidiLearnProvider>
 }

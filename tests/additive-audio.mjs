@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 
-const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
+const browserName = testBrowserName()
 const session = await startTestBrowser()
 try {
   const report = await session.page.evaluate(async () => {
@@ -242,10 +242,12 @@ try {
 
       const { engine: poly, update: updatePoly } = create({ amplitude: 0.08, adsr: { attack: 0.2, decay: 0.05, sustain: 1, release: 0.35 } })
       const beforePolyContexts = contexts.length
-      for (let midi = 48; midi < 56; midi++) await poly.noteOnVoice(note(midi))
+      // Submit each chord group together so per-note preparation cannot turn
+      // the intended simultaneous group into an arpeggio.
+      await Promise.all(Array.from({ length: 8 }, (_, index) => poly.noteOnVoice(note(48 + index))))
       setupAnalysis(poly)
       await sleep(90)
-      for (let midi = 56; midi < 64; midi++) await poly.noteOnVoice(note(midi))
+      await Promise.all(Array.from({ length: 8 }, (_, index) => poly.noteOnVoice(note(56 + index))))
       const staggeredVoices = active(poly)
       await sleep(650)
       const polyData = analyse(poly)

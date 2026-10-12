@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 
 const session = await startTestBrowser()
-const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
+const browserName = testBrowserName()
 try {
   const report = await session.page.evaluate(async () => {
     const { SynthEngine } = await import('/src/audio/SynthEngine.ts')

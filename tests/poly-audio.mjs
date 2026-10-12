@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 
-const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
+const browserName = testBrowserName()
 const session = await startTestBrowser()
 try {
   const report = await session.page.evaluate(async () => {
@@ -16,12 +16,85 @@ try {
     }
     const makeNote = (midi, options = {}) => ({ id: `A:1:${midi}`, midi, frequency: frequency(midi), velocity: 127, sourceId: 'A', sourceName: 'Simulated MIDI A', channel: 1, origin: 'midi', ...options })
     const NativeAudioContext = window.AudioContext
+    const NativeAudioWorkletNode = window.AudioWorkletNode
     const contexts = []
+    const controlNodes = []
+    const controlSplitters = []
+    const controlLeases = []
     const gainOutputs = new WeakMap()
+    const envelopeOwners = new WeakMap()
+    const controlMessages = new WeakMap()
+    const destructionProofs = new WeakMap()
+    const matchingState = (message, state) => message.type === 'state'
+      && message.slot === state.slot && message.generation === state.generation
+      && message.instanceId === state.instanceId && message.revision === state.revision
+      && message.appliedFrame === state.appliedFrame && message.endFrame === state.endFrame
+      && message.zeroFrame === state.zeroFrame && message.renderedThroughFrame === state.renderedThroughFrame
+    const renderedZero = (state, messages, context) => Boolean(state?.zero
+      && Number.isInteger(state.slot) && state.slot >= 0 && state.slot < 20
+      && Number.isSafeInteger(state.generation) && state.generation > 0
+      && Number.isSafeInteger(state.revision) && state.revision > 0
+      && state.acknowledgedRevision === state.revision
+      && Number.isSafeInteger(state.appliedFrame) && state.appliedFrame >= 0
+      && Number.isSafeInteger(state.endFrame) && state.endFrame >= 0
+      && Number.isSafeInteger(state.zeroFrame) && state.zeroFrame >= Math.max(state.endFrame, state.appliedFrame)
+      && Number.isSafeInteger(state.renderedThroughFrame) && state.renderedThroughFrame >= state.zeroFrame + 127
+      && messages.some(message => matchingState(message, state))
+      && controlNodes.some(record => record.context === context && record.messages.some(message => matchingState(message, state))))
+    const stopProof = (voice, carrier, velocity, context, startsAt) => {
+      const state = destructionProofs.get(voice) ?? voice?.getEnvelopeControlState()
+      const carrierLevel = Math.abs(carrier.gain.value * velocity.gain.value)
+      const processorZero = state?.connected === true && !state.destroyed && renderedZero(state, controlMessages.get(voice) ?? [], context)
+      // Intrinsic envelope.gain.value stays zero even while its connected
+      // worklet emits a loud signal. Only the processor's actual render ACK
+      // may authorize stopping an audible, already started voice.
+      const reason = context.currentTime < startsAt && state?.cancelSafeBeforeStart ? 'not-started'
+        : context.state !== 'running' ? 'context-not-running'
+          : carrierLevel < 0.0001 ? 'carrier-zero'
+            : processorZero ? 'processor-zero' : null
+      return { state, carrierLevel, intrinsicEnvelopeGain: voice?.envelope.gain.value, processorZero, reason, safe: reason !== null, stoppedAt: context.currentTime }
+    }
+    class RecordedAudioWorkletNode extends NativeAudioWorkletNode {
+      constructor(context, name, options) {
+        super(context, name, options)
+        if (name !== 'sound-lab-envelope-v1') return
+        const record = { node: this, context, disconnected: false, portClosed: false, errors: [], messages: [], outgoing: [] }
+        controlNodes.push(record)
+        this.addEventListener('processorerror', () => record.errors.push('processorerror'))
+        this.port.addEventListener('message', event => record.messages.push(structuredClone(event.data)))
+        const postMessage = this.port.postMessage.bind(this.port)
+        this.port.postMessage = (...args) => { record.outgoing.push(structuredClone(args[0])); return postMessage(...args) }
+        const disconnect = this.disconnect.bind(this)
+        this.disconnect = (...args) => { record.disconnected = true; return disconnect(...args) }
+        const close = this.port.close.bind(this.port)
+        this.port.close = () => { record.portClosed = true; return close() }
+      }
+    }
     class RecordedAudioContext extends NativeAudioContext {
       oscillators = []
       starts = 0
       constructor(options) { super(options); contexts.push(this) }
+      createChannelSplitter(channels) {
+        const splitter = super.createChannelSplitter(channels)
+        const record = { splitter, context: this, channels, edges: [], maximumLanes: 0 }
+        controlSplitters.push(record)
+        const connect = splitter.connect.bind(splitter)
+        splitter.connect = (destination, output = 0, input = 0) => {
+          const result = destination instanceof AudioParam ? connect(destination, output) : connect(destination, output, input)
+          if (!record.edges.some(edge => edge.active && edge.destination === destination && edge.output === output && edge.input === input)) record.edges.push({ destination, output, input, active: true })
+          record.maximumLanes = Math.max(record.maximumLanes, new Set(record.edges.filter(edge => edge.active && edge.destination instanceof AudioParam).map(edge => edge.output)).size)
+          return result
+        }
+        const disconnect = splitter.disconnect.bind(splitter)
+        splitter.disconnect = (...args) => {
+          const result = disconnect(...args)
+          for (const edge of record.edges) if (args.length === 0
+            || typeof args[0] === 'number' && edge.output === args[0]
+            || args[0] === edge.destination && (args[1] === undefined || args[1] === edge.output) && (args[2] === undefined || args[2] === edge.input)) edge.active = false
+          return result
+        }
+        return splitter
+      }
       createGain() {
         const gain = super.createGain()
         const nativeConnect = gain.connect.bind(gain)
@@ -44,7 +117,7 @@ try {
             const envelope = gainOutputs.get(carrier)
             const velocity = gainOutputs.get(envelope)
             if (carrier instanceof GainNode && envelope instanceof GainNode && velocity instanceof GainNode) {
-              record.stoppedVoiceLevels.push(this.currentTime < record.startsAt ? 0 : Math.abs(carrier.gain.value * envelope.gain.value * velocity.gain.value))
+              record.stoppedVoiceLevels.push(stopProof(envelopeOwners.get(envelope), carrier, velocity, this, record.startsAt))
             }
           }
           return nativeStop(...args)
@@ -55,6 +128,7 @@ try {
       }
     }
     window.AudioContext = RecordedAudioContext
+    window.AudioWorkletNode = RecordedAudioWorkletNode
     const engines = []
     const create = (changes = {}) => {
       const params = {
@@ -64,6 +138,25 @@ try {
         lfo: { enabled: false, rate: 3, depth: 0, target: 'pitch' }, ...changes,
       }
       const engine = new SynthEngine(params)
+      const add = engine.voices.add.bind(engine.voices)
+      engine.voices.add = voice => {
+        envelopeOwners.set(voice.envelope, voice)
+        const messages = []
+        controlMessages.set(voice, messages)
+        const lease = { context: voice.envelope.context, instanceId: voice.instanceId, slot: voice.envelopeControl.slot, generation: voice.envelopeControl.generation, disconnected: false, portClosed: false }
+        controlLeases.push(lease)
+        const disconnect = voice.envelopeControl.disconnect.bind(voice.envelopeControl)
+        voice.envelopeControl.disconnect = (...args) => { const result = disconnect(...args); lease.disconnected = true; return result }
+        const close = voice.envelopeControl.port.close.bind(voice.envelopeControl.port)
+        voice.envelopeControl.port.close = (...args) => { const result = close(...args); lease.portClosed = true; return result }
+        voice.envelopeControl.port.addEventListener('message', event => messages.push(event.data))
+        const destroy = voice.destroy.bind(voice)
+        voice.destroy = () => {
+          if (!voice.getEnvelopeControlState().destroyed) destructionProofs.set(voice, voice.getEnvelopeControlState())
+          destroy()
+        }
+        add(voice)
+      }
       engines.push(engine)
       return { engine, update: patch => { Object.assign(params, patch); engine.setParams(params) }, params }
     }
@@ -110,6 +203,15 @@ try {
     }
     const ids = engine => active(engine).filter(voice => voice.gateOpen).map(voice => voice.id).sort()
     const close = async engine => { await engine.dispose(); await sleep(25) }
+    const controlsFor = context => controlNodes.filter(record => record.context === context)
+    const leasesFor = context => controlLeases.filter(record => record.context === context)
+    const nativeLanesFor = context => new Set(controlSplitters.filter(record => record.context === context)
+      .flatMap(record => record.edges.filter(edge => edge.active && edge.destination instanceof AudioParam).map(edge => edge.output))).size
+    const waitFor = async predicate => {
+      const deadline = performance.now() + 750
+      while (!predicate() && performance.now() < deadline) await sleep(2)
+      return predicate()
+    }
     try {
       const { engine: lazy } = create()
       const initialContexts = contexts.length
@@ -120,6 +222,173 @@ try {
         ['no pending or held voice is created', lazy.getState().pendingCount === 0 && lazy.getState().voiceCount === 0],
       ])
       await close(lazy)
+
+      const { engine: waitingReady } = create()
+      await waitingReady.prepare()
+      const readyContext = contexts.at(-1)
+      const preparedState = waitingReady.getState()
+      const startsBeforeReady = readyContext.starts
+      // The shared processor is already ready. Live construction reserves a
+      // silent lane; a same-turn Note Off must cancel before the JS startup
+      // commit posts an Attack or starts the native carrier.
+      const readyPending = waitingReady.noteOnVoice(makeNote(60, { id: 'cancel-before-ready' }))
+      const unarmedVoice = waitingReady.voices.all[0]
+      const awaitingReady = unarmedVoice?.awaitingStart
+      const beforeReady = unarmedVoice?.getEnvelopeControlState()
+      const reservedReadyControl = waitingReady.getDiagnostics().envelopeControlCount
+      const nativeReadyControls = [...controlsFor(readyContext)]
+      const readyClaim = nativeReadyControls.flatMap(record => record.outgoing)
+        .find(message => message.type === 'claim' && message.instanceId === unarmedVoice?.instanceId)
+      const beforeReadyRamps = structuredClone(unarmedVoice?.envelopeRamps ?? [])
+      waitingReady.noteOffVoice('cancel-before-ready')
+      await readyPending
+      await sleep(110)
+      const afterReadyCancel = waitingReady.getDiagnostics()
+      const readyCancelState = waitingReady.getState()
+      const readyCancelSignal = analyse(waitingReady)
+      const readyCancelProof = destructionProofs.get(unarmedVoice)
+      await close(waitingReady)
+      const readyWire = nativeReadyControls.flatMap(record => record.outgoing)
+        .filter(message => message.instanceId === unarmedVoice?.instanceId)
+      const readyCancelPlans = readyWire.filter(message => message.type === 'plan')
+      check('Same-turn Note Off cancels a warm shared-lane voice before its scheduled audible onset', { preparedState, awaitingReady, beforeReady, beforeReadyRamps, readyClaim, readyWire, reservedReadyControl, startsBeforeReady, startsAfterCancel: readyContext.starts, readyCancelProof, readyCancelState, afterReadyCancel, rms: readyCancelSignal.rms, nativeControls: nativeReadyControls.map(({ disconnected, portClosed, errors }) => ({ disconnected, portClosed, errors })), leases: leasesFor(readyContext) }, [
+        ['a prepared running context immediately reserves one silent lease before its deferred live startup', preparedState.contextState === 'running' && reservedReadyControl === 1 && nativeReadyControls.length === 1 && awaitingReady && beforeReady?.revision === 0 && beforeReady?.acknowledgedRevision === null && beforeReadyRamps.length === 0 && readyClaim && readyClaim.initialPlan === undefined && Number.isFinite(unarmedVoice.startsAt) && readyContext.starts === startsBeforeReady],
+        ['canceling the startup posts only zero plans, never starts a carrier, and produces no PCM or later resurrection', readyContext.starts === startsBeforeReady && readyCancelPlans.length > 0 && readyCancelPlans.every(plan => plan.ramps.length > 0 && plan.ramps.every(ramp => ramp.from === 0 && ramp.to === 0)) && readyCancelSignal.rms < 0.00001 && readyCancelState.voiceCount === 0 && readyCancelState.pendingCount === 0 && afterReadyCancel.envelopeControlCount === 0 && afterReadyCancel.totalCarrierCount === 0],
+        ['same-turn cancellation renders a latest-plan zero before balanced resource cleanup', readyCancelProof?.connected && readyCancelProof.contextState === 'running' && renderedZero(readyCancelProof, controlMessages.get(unarmedVoice), readyContext) && afterReadyCancel.createdVoiceCount === 1 && afterReadyCancel.destroyedVoiceCount === 1],
+        ['cancellation releases its lane and dispose closes the one real processor port', readyContext.state === 'closed' && leasesFor(readyContext).length === 1 && leasesFor(readyContext).every(lease => lease.disconnected && lease.portClosed) && nativeLanesFor(readyContext) === 0 && nativeReadyControls.length === 1 && nativeReadyControls.every(record => record.disconnected && record.portClosed && record.errors.length === 0)],
+      ])
+
+      const { engine: control, update: updateControl } = create({ adsr: { attack: 0.004, decay: 0.004, sustain: 0, release: 0.025 } })
+      await control.noteOnVoice(makeNote(60))
+      const controlContext = contexts.at(-1)
+      const controlledVoice = control.voices.all[0]
+      const envelopeAnalyser = controlContext.createAnalyser()
+      envelopeAnalyser.fftSize = 256
+      const silentTap = controlContext.createGain()
+      silentTap.gain.value = 0
+      controlledVoice.envelopeControl.connect(envelopeAnalyser)
+      envelopeAnalyser.connect(silentTap)
+      silentTap.connect(controlContext.destination)
+      const controlSignal = () => {
+        const samples = new Float32Array(envelopeAnalyser.fftSize)
+        envelopeAnalyser.getFloatTimeDomainData(samples)
+        return { peak: Math.max(...samples.map(Math.abs)), mean: samples.reduce((sum, sample) => sum + sample, 0) / samples.length }
+      }
+      const messages = controlMessages.get(controlledVoice)
+      const initialZeroArrived = await waitFor(() => renderedZero(controlledVoice.getEnvelopeControlState(), messages, controlContext))
+      const initialZero = controlledVoice.getEnvelopeControlState()
+      // The zero ACK proves one rendered quantum. AnalyserNode still owns a
+      // 256-sample history, which must advance completely past that ACK before
+      // its entire time-domain buffer can legitimately be exactly zero.
+      const initialAnalyserTargetFrame = Math.max(Math.ceil(controlContext.currentTime * controlContext.sampleRate), (initialZero.renderedThroughFrame ?? -1) + 1) + envelopeAnalyser.fftSize
+      const initialAnalyserWindowAdvanced = await waitFor(() => Math.floor(controlContext.currentTime * controlContext.sampleRate) >= initialAnalyserTargetFrame)
+      const initialControlSignal = controlSignal()
+      updateControl({ adsr: { attack: 0.004, decay: 0.004, sustain: 0.8, release: 0.025 } })
+      const invalidatedZero = controlledVoice.getEnvelopeControlState()
+      await sleep(100)
+      const audibleControl = controlSignal()
+      const audibleState = controlledVoice.getEnvelopeControlState()
+      const audibleStopProof = stopProof(controlledVoice, controlledVoice.carrier.gain, controlledVoice.velocityGain, controlContext, controlledVoice.startsAt)
+      const nodesBeforeChanges = controlsFor(controlContext).length
+      for (let index = 0; index < 120; index++) updateControl({ adsr: { attack: 0.004 + (index % 3) * 0.001, decay: 0.004, sustain: index % 2 ? 0.8 : 0.7, release: 0.025 } })
+      const rapidRevision = controlledVoice.getEnvelopeControlState().revision
+      await waitFor(() => controlledVoice.getEnvelopeControlState().acknowledgedRevision === rapidRevision)
+      await sleep(60)
+      const rapidState = controlledVoice.getEnvelopeControlState()
+      const rapidSignal = controlSignal()
+      control.panic()
+      await waitFor(() => control.getDiagnostics().envelopeControlCount === 0)
+      const panicProof = destructionProofs.get(controlledVoice)
+      await close(control)
+      const releasedControl = controlledVoice.getEnvelopeControlState()
+      const nativeControls = controlsFor(controlContext)
+      envelopeAnalyser.disconnect()
+      silentTap.disconnect()
+      check('Native envelope control invalidates old zero ACKs and retires only after a latest-plan rendered zero', { initialZero, initialAnalyserTargetFrame, initialAnalyserWindowAdvanced, initialControlSignal, invalidatedZero, audibleControl, audibleState, audibleStopProof, rapidState, rapidSignal, panicProof, releasedControl, nodesBeforeChanges, nativeControls: nativeControls.map(({ disconnected, portClosed, errors }) => ({ disconnected, portClosed, errors })) }, [
+        ['initial silence is proved by an actual shared-port packet and zero control samples', initialZeroArrived && renderedZero(initialZero, messages, controlContext) && initialAnalyserWindowAdvanced && initialControlSignal.peak === 0],
+        ['a new musical plan immediately invalidates the previous zero acknowledgement', invalidatedZero.revision > initialZero.revision && !invalidatedZero.zero && invalidatedZero.zeroFrame === null && !invalidatedZero.safeToDestroy],
+        ['intrinsic zero cannot authorize stopping a genuinely nonzero native control signal', controlledVoice.envelope.gain.value === 0 && Math.abs(audibleControl.mean - 0.8) < 0.00001 && !audibleState.zero && !audibleStopProof.safe],
+        ['rapid ADSR plans are acknowledged without allocating extra native control nodes', rapidState.acknowledgedRevision === rapidRevision && rapidRevision >= invalidatedZero.revision + 120 && Math.abs(rapidSignal.mean - 0.8) < 0.00001 && nodesBeforeChanges === 1 && nativeControls.length === 1],
+        ['Panic waits for a new complete zero block rather than an obsolete silent plan', renderedZero(panicProof, messages, controlContext) && panicProof.revision > rapidRevision && panicProof.connected && !panicProof.notStarted],
+        ['dispose releases the leased lane and closes the physical control with no processor error', releasedControl.destroyed && !releasedControl.connected && control.getDiagnostics().envelopeControlCount === 0 && nativeLanesFor(controlContext) === 0 && leasesFor(controlContext).every(lease => lease.disconnected && lease.portClosed) && nativeControls.length === 1 && nativeControls.every(record => record.disconnected && record.portClosed && record.errors.length === 0)],
+      ])
+
+      const { engine: future } = create()
+      await future.prepare()
+      const futureContext = contexts.at(-1)
+      const futureStart = futureContext.currentTime + 0.18
+      const futureAdmissions = Array.from({ length: 16 }, (_, index) => future.scheduleNote(makeNote(48 + index, { id: `future:${index}`, sourceId: 'future', origin: 'sequence' }), futureStart, futureStart + 0.05))
+      const futureVoices = [...future.voices.all]
+      const reservedControls = future.getDiagnostics().envelopeControlCount
+      future.releaseVoices({ sourceId: 'future' }, true)
+      const canceledDiagnostics = future.getDiagnostics()
+      const cancelProofs = futureVoices.map(voice => destructionProofs.get(voice))
+      await sleep(300)
+      const canceledSignal = analyse(future)
+      await future.dispose()
+      await future.dispose()
+      await future.noteOnVoice(makeNote(72))
+      const futureControls = controlsFor(futureContext)
+      check('Canceled future sequence gates release shared lanes and never restart after their deadlines', { futureAdmissions, futureStart, reservedControls, cancelProofs, canceledDiagnostics, canceledRms: canceledSignal.rms, diagnostics: future.getDiagnostics(), nativeControls: futureControls.map(({ disconnected, portClosed, errors }) => ({ disconnected, portClosed, errors })), leases: leasesFor(futureContext) }, [
+        ['sixteen future voices lease sixteen distinct lanes on exactly one real processor', futureAdmissions.every(Boolean) && futureVoices.length === 16 && reservedControls === 16 && futureControls.length === 1 && leasesFor(futureContext).length === 16 && new Set(leasesFor(futureContext).map(lease => lease.slot)).size === 16],
+        ['cancellation destroys only safely distant future gates and removes every control immediately', cancelProofs.every(proof => proof?.notStarted && proof.cancelSafeBeforeStart && proof.connected && proof.contextState === 'running') && canceledDiagnostics.envelopeControlCount === 0 && canceledDiagnostics.totalCarrierCount === 0 && canceledDiagnostics.scheduledNoteCount === 0],
+        ['past the original ON and OFF deadlines the native output stays silent and no voice resurrects', canceledSignal.rms < 0.00001 && future.getState().voiceCount === 0 && future.getState().pendingCount === 0],
+        ['repeated disposal closes all lease ports and the shared native port without new allocation', futureContext.state === 'closed' && futureControls.every(record => record.disconnected && record.portClosed && record.errors.length === 0) && leasesFor(futureContext).every(lease => lease.disconnected && lease.portClosed) && nativeLanesFor(futureContext) === 0 && controlsFor(futureContext).length === 1 && future.getDiagnostics().envelopeControlCount === 0],
+      ])
+
+      const { engine: isolation } = create({ adsr: { attack: 0.004, decay: 0.004, sustain: 0.8, release: 0.025 } })
+      await isolation.prepare()
+      await Promise.all([60, 64].map(midi => isolation.noteOnVoice(makeNote(midi))))
+      const isolationContext = contexts.at(-1)
+      const [heldLane, releasedLane] = isolation.voices.all
+      const taps = []
+      const tapLane = voice => {
+        const analyser = isolationContext.createAnalyser(), sink = isolationContext.createGain()
+        analyser.fftSize = 256; sink.gain.value = 0
+        voice.envelopeControl.connect(analyser); analyser.connect(sink); sink.connect(isolationContext.destination)
+        taps.push({ analyser, sink })
+        return () => {
+          const samples = new Float32Array(256)
+          analyser.getFloatTimeDomainData(samples)
+          return { mean: samples.reduce((sum, value) => sum + value, 0) / samples.length, peak: Math.max(...samples.map(Math.abs)) }
+        }
+      }
+      const heldSignal = tapLane(heldLane), releasedSignal = tapLane(releasedLane)
+      await sleep(100)
+      const heldBefore = heldSignal(), releasedBefore = releasedSignal()
+      isolation.noteOffVoice(releasedLane.note.id)
+      const releasedGone = await waitFor(() => isolation.getDiagnostics().envelopeControlCount === 1)
+      const releasedProof = destructionProofs.get(releasedLane)
+      await sleep(30) // Let the 256-sample analyser window contain only post-release samples.
+      const heldAfterRelease = heldSignal(), releasedAfter = releasedSignal()
+      await isolation.noteOnVoice(makeNote(67))
+      const reusedLane = isolation.voices.all.find(voice => voice.note.midi === 67)
+      const reusedSignal = tapLane(reusedLane)
+      await sleep(80)
+      const physicalIsolation = controlsFor(isolationContext)[0]
+      const stalePlan = physicalIsolation.outgoing.find(message => message.type === 'plan' && message.instanceId === releasedLane.instanceId && message.generation === releasedLane.envelopeControl.generation)
+      if (!stalePlan) throw new Error('Native shared port never received the released lane plan')
+      const staleAt = isolationContext.currentTime + isolation.getDiagnostics().controlLeadSeconds
+      const injectedStalePlan = { ...stalePlan, revision: stalePlan.revision + 1000000, at: staleAt, ramps: [{ start: staleAt, end: staleAt + 0.01, from: 0, to: 0 }] }
+      // Bypass the closed facade deliberately: only processor-side generation
+      // validation can reject this real native MessagePort injection.
+      physicalIsolation.node.port.postMessage(injectedStalePlan)
+      releasedLane.envelopeControl.port.postMessage(injectedStalePlan)
+      await sleep(100)
+      const heldAfterStale = heldSignal(), reusedAfterStale = reusedSignal()
+      const reusedState = reusedLane.getEnvelopeControlState()
+      const lanePacketsIsolated = [heldLane, releasedLane, reusedLane].every(voice => controlMessages.get(voice).every(message => message.type !== 'state'
+        || message.slot === voice.envelopeControl.slot && message.generation === voice.envelopeControl.generation && message.instanceId === voice.instanceId))
+      await close(isolation)
+      for (const { analyser, sink } of taps) { analyser.disconnect(); sink.disconnect() }
+      check('Shared envelope lanes isolate Release and reject stale generations after native slot reuse', { heldBefore, releasedBefore, releasedGone, releasedProof, heldAfterRelease, releasedAfter, heldAfterStale, reusedAfterStale, reusedState, injectedStalePlan, slots: [heldLane, releasedLane, reusedLane].map(voice => ({ instanceId: voice.instanceId, slot: voice.envelopeControl.slot, generation: voice.envelopeControl.generation })), lanePacketsIsolated }, [
+        ['two independently connected native control lanes render their real sustain values', heldLane.envelopeControl.slot !== releasedLane.envelopeControl.slot && Math.abs(heldBefore.mean - 0.8) < 0.00001 && Math.abs(releasedBefore.mean - 0.8) < 0.00001],
+        ['releasing one lane proves latest native zero without changing the other lane', releasedGone && renderedZero(releasedProof, controlMessages.get(releasedLane), isolationContext) && releasedAfter.peak === 0 && Math.abs(heldAfterRelease.mean - 0.8) < 0.00001],
+        ['a reused slot has a new generation and cannot inherit the previous voice identity', reusedLane.envelopeControl.slot === releasedLane.envelopeControl.slot && reusedLane.envelopeControl.generation > releasedLane.envelopeControl.generation && reusedLane.instanceId !== releasedLane.instanceId],
+        ['a stale native plan cannot mute the reused lane or an unrelated held lane', Math.abs(reusedAfterStale.mean - 0.8) < 0.00001 && Math.abs(heldAfterStale.mean - 0.8) < 0.00001 && reusedState.revision < injectedStalePlan.revision],
+        ['facade events contain only real packets for their own slot generation and instance', lanePacketsIsolated && [heldLane, releasedLane, reusedLane].every(voice => controlMessages.get(voice).some(message => message.type === 'state'))],
+        ['all three leases use one physical processor and dispose closes it with no lane left connected', controlsFor(isolationContext).length === 1 && nativeLanesFor(isolationContext) === 0 && leasesFor(isolationContext).every(lease => lease.disconnected && lease.portClosed) && physicalIsolation.disconnected && physicalIsolation.portClosed && physicalIsolation.errors.length === 0],
+      ])
 
       const { engine: chord, update: updateChord } = create()
       const contextBeforeChord = contexts.length
@@ -338,10 +607,12 @@ try {
 
       const { engine: limits } = create({ adsr: { attack: 0.005, decay: 0.005, sustain: 1, release: 2 } })
       for (let midi = 40; midi < 56; midi++) { await limits.noteOnVoice(makeNote(midi)); await sleep(2) }
+      const limitsContext = contexts.at(-1)
       const fullVoices = active(limits)
       check('Sixteen independently held voices fit the declared limit', { state: limits.getState(), diagnostics: limits.getDiagnostics() }, [
         ['all sixteen managed voices are gated', fullVoices.length === 16 && limits.getState().voiceCount === 16 && limits.getState().heldCount === 16],
         ['sixteen voices share one carrier each at steady state', limits.getDiagnostics().totalCarrierCount === 16],
+        ['sixteen held voices own distinct native splitter lanes on one physical processor', limits.getDiagnostics().envelopeControlCount === 16 && limits.getDiagnostics().maxEnvelopeControls === 20 && controlsFor(limitsContext).length === 1 && nativeLanesFor(limitsContext) === 16],
       ])
       limits.noteOffVoice('A:1:50')
       await limits.noteOnVoice(makeNote(56))
@@ -362,6 +633,8 @@ try {
       let maximumManaged = 0
       let maximumRetiring = 0
       let maximumCarriers = 0
+      let maximumControls = 0
+      let maximumNativeControls = 0
       for (let index = 0; index < 85; index++) {
         const midi = 36 + index % 60
         await limits.noteOnVoice(makeNote(midi, { id: `burst:${index}` }))
@@ -370,17 +643,20 @@ try {
         maximumManaged = Math.max(maximumManaged, limits.getState().voiceCount)
         maximumRetiring = Math.max(maximumRetiring, diagnostics.retiringCount)
         maximumCarriers = Math.max(maximumCarriers, diagnostics.totalCarrierCount)
+        maximumControls = Math.max(maximumControls, diagnostics.envelopeControlCount)
+        maximumNativeControls = Math.max(maximumNativeControls, controlsFor(limitsContext).filter(record => !record.disconnected).length)
       }
-      check('Rapid long-Release playing cannot accumulate unlimited nodes', { maximumManaged, maximumRetiring, maximumCarriers, diagnostics: limits.getDiagnostics() }, [
+      check('Rapid long-Release playing cannot accumulate unlimited nodes', { maximumManaged, maximumRetiring, maximumCarriers, maximumControls, maximumNativeControls, diagnostics: limits.getDiagnostics() }, [
         ['managed pool stays at or below sixteen including Release', maximumManaged <= 16],
         ['forced fade tails stay at or below four', maximumRetiring <= 4],
         ['carrier graph remains globally bounded', maximumCarriers <= 40],
+        ['leased envelope lanes stay bounded and share exactly one physical processor', maximumControls > 0 && maximumControls <= 20 && maximumNativeControls === 1 && controlsFor(limitsContext).length === 1 && controlSplitters.filter(record => record.context === limitsContext).every(record => record.maximumLanes <= 20)],
       ])
       limits.panic()
       await sleep(110)
       check('Panic smoothly clears a full polyphonic graph', { state: limits.getState(), diagnostics: limits.getDiagnostics(), signal: analyse(limits).rms }, [
         ['Panic closes every gate and cancels pending notes', limits.getState().heldCount === 0 && limits.getState().pendingCount === 0],
-        ['all forced fades finish with no surviving carrier', limits.getVoices().length === 0 && limits.getDiagnostics().totalCarrierCount === 0],
+        ['all forced fades finish with no surviving carrier or envelope control', limits.getVoices().length === 0 && limits.getDiagnostics().totalCarrierCount === 0 && limits.getDiagnostics().envelopeControlCount === 0],
         ['actual mixed output becomes silent promptly', analyse(limits).rms < 0.00001],
       ])
       await close(limits)
@@ -399,7 +675,7 @@ try {
       check('Overlapping steals wait for a zero-level tail before destroying a native oscillator', { queuedBeforeOff, diagnostics: queued.getDiagnostics(), stoppedVoiceLevels: stopLevels }, [
         ['overflow admission queues instead of exceeding the bounded tail pool', queuedBeforeOff.pendingCount > 0 && queued.getDiagnostics().retiringCount <= 4 && queued.getState().voiceCount <= 16],
         ['Note Off cancels an admission waiting for a steal slot', !queued.getVoices().some(voice => voice.id === 'queued:23') && queued.getState().pendingCount === 0],
-        ['every immediate carrier destruction occurs after its audible gain is zero', stopLevels.length > 0 && stopLevels.every(level => level < 0.0001)],
+        ['every immediate carrier destruction has actual zero evidence', stopLevels.length > 0 && stopLevels.every(proof => proof.safe) && stopLevels.some(proof => proof.reason === 'processor-zero')],
       ])
       const pendingScopeAdmissions = []
       for (let index = 0; index < 24; index++) pendingScopeAdmissions.push(queued.noteOnVoice(makeNote(60 + index % 12, { id: `scope-queue:${index}`, sourceId: 'C', sourceName: 'Simulated MIDI C', channel: 3 })))
@@ -416,8 +692,8 @@ try {
       await Promise.all(pendingPanicAdmissions)
       await sleep(100)
       check('Panic cancels queued steals as well as sounding voices', { state: queued.getState(), diagnostics: queued.getDiagnostics() }, [
-        ['no queued voice or carrier survives Panic', queued.getState().pendingCount === 0 && queued.getVoices().length === 0 && queued.getDiagnostics().totalCarrierCount === 0],
-        ['all destroyed carriers reach a zero voice level first', queuedContext.oscillators.flatMap(record => record.stoppedVoiceLevels).every(level => level < 0.0001)],
+        ['no queued voice carrier or control node survives Panic', queued.getState().pendingCount === 0 && queued.getVoices().length === 0 && queued.getDiagnostics().totalCarrierCount === 0 && queued.getDiagnostics().envelopeControlCount === 0],
+        ['all destroyed carriers have render-thread zero ACKs or a silent carrier or unstarted gate', queuedContext.oscillators.flatMap(record => record.stoppedVoiceLevels).every(proof => proof.safe)],
       ])
       await close(queued)
 
@@ -482,21 +758,25 @@ try {
       const soakContext = contexts.at(-1)
       let soakMaximumVoices = 0
       let soakMaximumCarriers = 0
+      let soakMaximumControls = 0
       for (let index = 0; index < 160; index++) {
         const note = makeNote(48 + index % 36, { id: `soak:${index}` })
         await soak.noteOnVoice(note)
         if (index % 13 === 0) updateSoak({ waveform: ['sine', 'square', 'triangle'][index % 3] })
-        await sleep(4)
-        soak.noteOffVoice(note.id)
+        // Observe allocated resources before the intentionally short gate is
+        // canceled ahead of its scheduled audible start.
         soakMaximumVoices = Math.max(soakMaximumVoices, soak.getState().voiceCount)
         soakMaximumCarriers = Math.max(soakMaximumCarriers, soak.getDiagnostics().totalCarrierCount)
+        soakMaximumControls = Math.max(soakMaximumControls, soak.getDiagnostics().envelopeControlCount)
+        await sleep(4)
+        soak.noteOffVoice(note.id)
       }
       await sleep(250)
       const soakDiagnostics = soak.getDiagnostics()
-      check('Extended repeated playing releases finished voice resources', { soakMaximumVoices, soakMaximumCarriers, diagnostics: soakDiagnostics, nativeOscillatorsCreated: soakContext.oscillators.length, nativeOscillatorsEnded: soakContext.oscillators.filter(record => record.ended).length }, [
-        ['series remains within voice and carrier caps', soakMaximumVoices <= 16 && soakMaximumCarriers <= 40],
+      check('Extended repeated playing releases finished voice resources', { soakMaximumVoices, soakMaximumCarriers, soakMaximumControls, diagnostics: soakDiagnostics, nativeOscillatorsCreated: soakContext.oscillators.length, nativeOscillatorsEnded: soakContext.oscillators.filter(record => record.ended).length }, [
+        ['series remains within voice carrier and envelope control caps', soakMaximumVoices <= 16 && soakMaximumCarriers <= 40 && soakMaximumControls > 0 && soakMaximumControls <= 20],
         ['every completed voice is destroyed', soakDiagnostics.createdVoiceCount >= 160 && soakDiagnostics.createdVoiceCount === soakDiagnostics.destroyedVoiceCount],
-        ['empty manager retains no voice carrier', soak.getVoices().length === 0 && soakDiagnostics.totalCarrierCount === 0 && analyse(soak).rms < 0.00001],
+        ['empty manager retains no voice carrier or control node', soak.getVoices().length === 0 && soakDiagnostics.totalCarrierCount === 0 && soakDiagnostics.envelopeControlCount === 0 && analyse(soak).rms < 0.00001],
         ['all native voice oscillators have ended', soakContext.oscillators.filter(record => !record.ended).length <= 1],
       ])
       await soak.noteOnVoice(makeNote(60))
@@ -507,6 +787,7 @@ try {
       check('Dispose closes the shared context and all native nodes', { state: soak.getState(), diagnostics: soak.getDiagnostics(), nativeOscillators: soakContext.oscillators.map(record => ({ ended: record.ended, disconnected: record.disconnected })) }, [
         ['disposed context stays closed and no voice can restart', soak.getState().contextState === 'closed' && soak.getState().voiceCount === 0 && soak.getState().pendingCount === 0],
         ['all native oscillators are disconnected', soakContext.oscillators.every(record => record.disconnected)],
+        ['dispose releases every envelope control and proves each audible native stop safe', soak.getDiagnostics().envelopeControlCount === 0 && soakContext.oscillators.flatMap(record => record.stoppedVoiceLevels).every(proof => proof.safe)],
         ['disposed engine exposes no analyser', soak.getAnalysis() === null],
       ])
 
@@ -571,11 +852,17 @@ try {
       await Promise.all(disposalPending)
       check('Dispose cancels an entire pending chord', { state: deferredDispose.getState(), diagnostics: deferredDispose.getDiagnostics() }, [
         ['context remains closed without pending or active voices', deferredDispose.getState().contextState === 'closed' && deferredDispose.getState().voiceCount === 0 && deferredDispose.getState().pendingCount === 0],
-        ['all node references are released', deferredDispose.getDiagnostics().totalCarrierCount === 0 && deferredDispose.getAnalysis() === null],
+        ['all node references are released', deferredDispose.getDiagnostics().totalCarrierCount === 0 && deferredDispose.getDiagnostics().envelopeControlCount === 0 && deferredDispose.getAnalysis() === null],
+      ])
+      check('Every native context uses at most one physical envelope processor and releases every leased lane', { contexts: contexts.map(context => ({ state: context.state, processors: controlsFor(context).length, leases: leasesFor(context).length, connectedLanes: nativeLanesFor(context), maximumLanes: Math.max(0, ...controlSplitters.filter(record => record.context === context).map(record => record.maximumLanes)) })), physicalProcessors: controlNodes.map(({ disconnected, portClosed, errors }) => ({ disconnected, portClosed, errors })) }, [
+        ['each context with voice leases constructed exactly one native AudioWorkletNode', contexts.every(context => controlsFor(context).length <= 1 && (leasesFor(context).length === 0 || controlsFor(context).length === 1))],
+        ['independent native splitter observations never exceed twenty lanes and all leases close', controlSplitters.every(record => record.maximumLanes <= 20) && controlLeases.every(lease => lease.disconnected && lease.portClosed) && contexts.every(context => nativeLanesFor(context) === 0)],
+        ['each disposed shared processor is disconnected and its actual MessagePort is closed without errors', controlNodes.length > 0 && controlNodes.every(record => record.context.state === 'closed' && record.disconnected && record.portClosed && record.errors.length === 0)],
       ])
       return { results, failures: results.flatMap(result => result.checks.filter(assertion => !assertion.passed).map(assertion => `${result.name}: ${assertion.description}`)) }
     } finally {
       window.AudioContext = NativeAudioContext
+      window.AudioWorkletNode = NativeAudioWorkletNode
       await Promise.all(engines.map(engine => engine.dispose()))
     }
   })

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
 import { runPcmSuite } from './pcm-harness.mjs'
 
-const browserName = /msedge/i.test(process.env.SOUND_LAB_BROWSER || '') ? 'edge' : 'chrome'
+const browserName = testBrowserName()
 let session = await startTestBrowser()
 try {
   const run = async () => session.page.evaluate(async () => {

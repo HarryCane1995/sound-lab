@@ -4,6 +4,14 @@ import { MAX_LIBRARY_PHRASES, MAX_PHRASE_NOTES, MAX_PHRASE_SECONDS, type Phrase,
 
 export const PHRASE_DB = 'sound-lab.phrases.v1'
 export const MAX_IMPORT_BYTES = 32 * 1024 * 1024
+export const MAX_LIBRARY_IMPORT_BYTES = 64 * 1024 * 1024
+export interface PhraseLibraryBackup {
+  format: 'sound-lab.library'
+  version: 1
+  exportedAt: number
+  phrases: Phrase[]
+  draft: Phrase | null
+}
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const numberIn = (v: unknown, min: number, max: number): v is number => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max
 const text = (v: unknown, max = 512): v is string => typeof v === 'string' && v.length > 0 && v.length <= max
@@ -45,6 +53,10 @@ export function snapshotSound(value: SynthParams): SynthParams {
   return copyParams({ mode: value.mode, waveform: value.waveform, frequency: value.frequency, amplitude: value.amplitude,
     additive: value.additive, adsr: value.adsr, filter: value.filter, lfo: value.lfo })
 }
+export function validateSoundSnapshot(value: unknown): SynthParams {
+  if (!validSound(value)) throw new Error('Недопустимый Sound Snapshot.')
+  return snapshotSound(value)
+}
 
 export function exportPhraseJson(phrase: Phrase): string { return JSON.stringify({ format: 'sound-lab.phrase', version: 1, phrase: validatePhrase(phrase) }, null, 2) }
 export function importPhraseJson(raw: string): Phrase {
@@ -53,6 +65,36 @@ export function importPhraseJson(raw: string): Phrase {
   if (!isRecord(data) || data.format !== 'sound-lab.phrase' || data.version !== 1) throw new Error('Неподдерживаемая версия Phrase JSON.')
   const phrase = validatePhrase(data.phrase)
   return { ...phrase, id: phraseId(), updatedAt: Date.now() }
+}
+
+function validateLibrary(value: unknown): PhraseLibraryBackup {
+  if (!isRecord(value) || value.format !== 'sound-lab.library' || value.version !== 1
+    || !numberIn(value.exportedAt, 0, 1e15) || !Array.isArray(value.phrases) || value.phrases.length > MAX_LIBRARY_PHRASES
+    || !(value.draft === null || isRecord(value.draft))) throw new Error('Неподдерживаемый или повреждённый Library JSON.')
+  const phrases = value.phrases.map(validatePhrase)
+  if (new Set(phrases.map(phrase => phrase.id)).size !== phrases.length) throw new Error('В Library JSON повторяются идентификаторы фраз.')
+  return { format: 'sound-lab.library', version: 1, exportedAt: value.exportedAt, phrases, draft: value.draft ? validatePhrase(value.draft) : null }
+}
+
+export function exportLibraryJson(phrases: Phrase[], draft: Phrase | null): string {
+  const result = JSON.stringify(validateLibrary({ format: 'sound-lab.library', version: 1, exportedAt: Date.now(), phrases, draft }), null, 2)
+  if (new TextEncoder().encode(result).length > MAX_LIBRARY_IMPORT_BYTES) throw new Error('Библиотека больше 64 MiB. Экспортируйте крупные фразы по отдельности через Export JSON.')
+  return result
+}
+
+export function importLibraryJson(raw: string): PhraseLibraryBackup {
+  if (new TextEncoder().encode(raw).length > MAX_LIBRARY_IMPORT_BYTES) throw new Error('Library JSON больше 64 MiB.')
+  return validateLibrary(JSON.parse(raw) as unknown)
+}
+
+/** Compare saved musical content, independently of storage timestamps. */
+export function phraseHasUnsavedChanges(draft: Phrase | null, saved: Phrase | undefined, pendingName?: string): boolean {
+  if (!draft?.notes.length) return Boolean(pendingName?.trim())
+  if (!saved) return true
+  const content = (phrase: Phrase) => ({ name: phrase.name, duration: phrase.duration, bpm: phrase.bpm, recordingMode: phrase.recordingMode,
+    notes: phrase.notes.map(note => [note.id, note.eventId, note.sourceId, note.sourceName, note.channel, note.midi, note.velocity, note.start, note.end]),
+    sound: phrase.sound ? snapshotSound(phrase.sound) : null })
+  return (pendingName ?? draft.name) !== saved.name || JSON.stringify(content(draft)) !== JSON.stringify(content(saved))
 }
 
 let connection: Promise<IDBDatabase> | null = null
@@ -73,7 +115,7 @@ async function transact<T>(store: 'phrases' | 'draft', mode: IDBTransactionMode,
     const transaction = db.transaction(store, mode)
     const request = action(transaction.objectStore(store))
     transaction.oncomplete = () => resolve(request.result)
-    transaction.onabort = transaction.onerror = () => reject(transaction.error ?? request.error ?? new Error('Не удалось записать данные; проверьте доступ и свободное место.'))
+    transaction.onabort = () => reject(transaction.error ?? request.error ?? new Error('Не удалось записать данные; проверьте доступ и свободное место.'))
   })
 }
 
@@ -96,10 +138,35 @@ export async function savePhrase(phrase: Phrase): Promise<void> {
       count.onsuccess = () => { if (!existing.result && count.result >= MAX_LIBRARY_PHRASES) { reason = 'Лимит библиотеки: 200 фраз. Экспортируйте и удалите ненужные.'; tx.abort() } else store.put(copyPhrase(data)) }
     }
     tx.oncomplete = () => resolve()
-    tx.onabort = tx.onerror = () => reject(new Error(reason || tx.error?.message || 'Не удалось сохранить фразу; проверьте свободное место.'))
+    tx.onabort = () => reject(new Error(reason || tx.error?.message || 'Не удалось сохранить фразу; проверьте свободное место.'))
   })
 }
 export async function deletePhrase(id: string): Promise<void> { await transact('phrases', 'readwrite', store => store.delete(id)) }
+/** Add an entire validated backup atomically; existing phrases are never replaced. */
+export async function restoreLibrary(backup: PhraseLibraryBackup): Promise<{ phrases: Phrase[]; draft: Phrase | null }> {
+  const data = validateLibrary(backup)
+  const ids = new Map(data.phrases.map(phrase => [phrase.id, phraseId()]))
+  const phrases = data.phrases.map(phrase => ({ ...copyPhrase(phrase), id: ids.get(phrase.id)! }))
+  const draft = data.draft ? { ...copyPhrase(data.draft), id: ids.get(data.draft.id) ?? phraseId() } : null
+  const db = await database()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(['phrases', 'draft'], 'readwrite'), store = tx.objectStore('phrases')
+    let reason = ''
+    const count = store.count()
+    count.onsuccess = () => {
+      if (count.result + phrases.length > MAX_LIBRARY_PHRASES) {
+        reason = `Для импорта ${phrases.length} фраз недостаточно места в лимите 200. Существующая библиотека не изменена.`
+        tx.abort(); return
+      }
+      // add(), rather than put(), also rejects an unlikely ID collision.
+      for (const phrase of phrases) store.add(phrase)
+      if (draft) tx.objectStore('draft').put(draft, 'current')
+    }
+    tx.oncomplete = () => resolve()
+    tx.onabort = () => reject(new Error(reason || `Импорт отменён целиком: проверьте доступ к хранилищу и свободное место. Существующая библиотека сохранена.${tx.error ? ` ${tx.error.message}` : ''}`))
+  })
+  return { phrases, draft }
+}
 export async function saveDraft(phrase: Phrase | null): Promise<void> {
   if (phrase) await transact('draft', 'readwrite', store => store.put(validatePhrase(phrase), 'current'))
   else await transact('draft', 'readwrite', store => store.delete('current'))

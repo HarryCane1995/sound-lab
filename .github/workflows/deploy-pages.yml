@@ -1,0 +1,110 @@
+name: Verify and deploy SOUND LAB
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Build and test code needs no repository write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SOUND_LAB_TEST_URL: http://127.0.0.1:5173/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Install Chromium and Linux browser dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Check TypeScript
+        run: npm run typecheck
+
+      - name: Build production PWA
+        run: npm run build
+
+      - name: Start development server for regression tests
+        shell: bash
+        run: |
+          mkdir -p test-results
+          node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort > test-results/vite-dev.log 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/sound-lab-vite.pid"
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          cat test-results/vite-dev.log
+          exit 1
+
+      - name: Run all audio, MIDI, recorder, UI and production PWA tests
+        # test:pwa serves the built dist under /sound-lab/ itself, including
+        # its second-version update fixture; it never tests offline via HMR.
+        run: npm run test:all
+
+      - name: Stop development server
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/sound-lab-vite.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/sound-lab-vite.pid")" 2>/dev/null || true
+          fi
+
+      - name: Keep verification reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verification-reports
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload verified production build
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Publish verified build
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Show published URL
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: printf 'SOUND LAB deployed to %s\n' "$PAGE_URL" >> "$GITHUB_STEP_SUMMARY"

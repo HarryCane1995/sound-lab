@@ -13,23 +13,23 @@ export class PhraseCapture {
   private clock: () => number
   constructor(clock: () => number = () => performance.now()) { this.clock = clock }
   get recording(): boolean { return this.phrase !== null }
-  get elapsed(): number { return this.phrase ? Math.min(MAX_PHRASE_SECONDS, Math.max(0, (this.clock() - this.started) / 1000)) : 0 }
+  get elapsed(): number { return this.phrase ? this.elapsedAt() : 0 }
   start(bpm: number, recordingMode: RecordingMode, sound: SynthParams | null = null, startedAt?: number): void {
-    this.started = startedAt ?? this.clock(); this.held.clear()
+    this.started = Number.isFinite(startedAt) ? startedAt! : this.clock(); this.held.clear()
     const now = Date.now()
     this.phrase = { version: 1, id: phraseId(), name: 'Новая фраза', createdAt: now, updatedAt: now, duration: 0, bpm, recordingMode, notes: [], sound: sound ? copyParams(sound) : null }
   }
-  noteOn(note: LivePhraseNote): void {
+  noteOn(note: LivePhraseNote, at?: number): void {
     if (!this.phrase || this.held.has(note.id) || this.phrase.notes.length >= MAX_PHRASE_NOTES || note.velocity <= 0) return
-    const start = this.elapsed
+    const start = this.elapsedAt(at)
     if (start >= MAX_PHRASE_SECONDS) return
     const entry: PhraseNote = { ...note, id: phraseId(), eventId: note.id, start, end: start + 0.001 }
     this.phrase.notes.push(entry); this.held.set(note.id, entry)
   }
-  noteOff(id: string): void {
+  noteOff(id: string, at?: number): void {
     const note = this.held.get(id)
     if (!note) return
-    note.end = Math.min(MAX_PHRASE_SECONDS, Math.max(note.start + 0.001, this.elapsed))
+    note.end = Math.min(MAX_PHRASE_SECONDS, Math.max(note.start + 0.001, this.elapsedAt(at)))
     this.held.delete(id)
   }
   releaseSource(sourceId: string, channel?: number): void {
@@ -48,6 +48,10 @@ export class PhraseCapture {
     const result = this.snapshot()
     this.phrase = null; this.held.clear()
     return result?.notes.length ? result : null
+  }
+  private elapsedAt(at?: number): number {
+    const time = Number.isFinite(at) ? at! : this.clock()
+    return Math.min(MAX_PHRASE_SECONDS, Math.max(0, (time - this.started) / 1000))
   }
 }
 

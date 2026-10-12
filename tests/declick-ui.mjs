@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
-import { startTestBrowser } from './helpers.mjs'
+import { startTestBrowser, testBrowserName } from './helpers.mjs'
+import { runPcmSuite } from './pcm-harness.mjs'
 
-const session = await startTestBrowser(), { page } = session
+let session, page
 const results = [], errors = []
-page.on('pageerror', error => errors.push(error.message))
-page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
-try {
+const browserName = testBrowserName(), runId = Date.now().toString(36)
+const captureAttempts = [], invalidCaptures = []
+let lastMetrics = null, deferredResumeCancellation = false
+async function setupSession() {
+  session = await startTestBrowser(); page = session.page
+  page.on('pageerror', error => errors.push(error.message))
+  page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   await page.addInitScript(() => {
     class Port extends EventTarget {
       constructor() { super(); this.id = 'declick-controller'; this.name = 'Declick Test MIDI'; this.manufacturer = 'Simulated'; this.type = 'input'; this.state = 'connected'; this.connection = 'closed' }
@@ -23,17 +28,69 @@ try {
     const moduleUrl = performance.getEntriesByType('resource').findLast(item => item.name.includes('/src/audio/SynthEngine.ts'))?.name ?? '/src/audio/SynthEngine.ts'
     const { SynthEngine } = await import(moduleUrl)
     const trace = window.__declick = { engine: null, inputs: [], created: new Map(), retriggers: 0 }
+    const NativeAudioWorkletNode = window.AudioWorkletNode
+    window.AudioWorkletNode = class extends NativeAudioWorkletNode {
+      constructor(context, name, options) {
+        super(context, name, options)
+        if (name !== 'sound-lab-envelope-v1') return
+        this.port.addEventListener('message', event => {
+          const record = trace.created.get(event.data.instanceId)
+          if (record && event.data.type === 'state' && event.data.slot === record.controlAtAllocation.slot && event.data.generation === record.controlAtAllocation.generation) record.nativeControlStates.push(structuredClone(event.data))
+        })
+      }
+    }
+    const oscillatorStarts = new WeakMap()
+    const oscillatorCreatedWall = new WeakMap()
+    const createOscillator = AudioContext.prototype.createOscillator
+    AudioContext.prototype.createOscillator = function (...args) {
+      const createdWall = performance.now(), oscillator = createOscillator.apply(this, args), starts = []
+      oscillatorStarts.set(oscillator, starts)
+      oscillatorCreatedWall.set(oscillator, createdWall)
+      const start = oscillator.start.bind(oscillator)
+      oscillator.start = (...startArgs) => { starts.push({ calledAt: this.currentTime, calledWall: performance.now(), scheduledAt: startArgs[0] ?? this.currentTime }); return start(...startArgs) }
+      return oscillator
+    }
     const getAnalysis = SynthEngine.prototype.getAnalysis
     SynthEngine.prototype.getAnalysis = function (...args) { trace.engine = this; return getAnalysis.apply(this, args) }
     const noteOn = SynthEngine.prototype.noteOnVoice
     SynthEngine.prototype.noteOnVoice = function (note) {
       trace.engine = this
-      const input = { id: note.id, sourceId: note.sourceId, time: this.getAnalysis()?.time.context.currentTime ?? 0 }
+      const input = { id: note.id, sourceId: note.sourceId, wall: performance.now(), time: this.getAnalysis()?.time.context.currentTime ?? 0, instanceId: null }
       trace.inputs.push(input)
       return noteOn.call(this, note).then(() => {
-        const voice = this.getVoices().find(voice => voice.id === note.id && voice.gateOpen)
-        if (voice) trace.created.set(voice.instanceId, { id: voice.id, instanceId: voice.instanceId, createdAt: voice.createdAt, latency: voice.createdAt - input.time, frequency: voice.frequency, sourceId: voice.sourceId })
+        input.resolvedAt = this.getAnalysis()?.time.context.currentTime ?? null
+        const record = trace.created.get(input.instanceId)
+        if (record) record.completion = { at: input.resolvedAt, wall: performance.now(), startsAt: record.voice.startsAt, gateOpen: record.voice.gateOpen, control: record.voice.getEnvelopeControlState() }
       })
+    }
+    const managerUrl = performance.getEntriesByType('resource').findLast(item => item.name.includes('/src/audio/VoiceManager.ts'))?.name ?? '/src/audio/VoiceManager.ts'
+    const { VoiceManager } = await import(managerUrl), add = VoiceManager.prototype.add
+    VoiceManager.prototype.add = function (voice) {
+      const result = add.call(this, voice)
+      const input = trace.inputs.findLast(input => input.instanceId === null && input.id === voice.note.id && input.sourceId === voice.note.sourceId)
+      if (!input) throw new Error(`Native voice allocation has no matching input: ${voice.note.id}`)
+      input.instanceId = voice.instanceId
+      const context = voice.envelope.context
+      const starts = oscillatorStarts.get(voice.carrier.oscillator)
+      if (!starts) throw new Error('Native carrier was constructed before the start-event instrumentation')
+      const record = { id: voice.note.id, instanceId: voice.instanceId, createdAt: voice.createdAt, carrierCreatedWall: oscillatorCreatedWall.get(voice.carrier.oscillator), allocationWall: performance.now(), allocationAt: context.currentTime, latency: voice.createdAt - input.time, frequency: voice.note.frequency, sourceId: voice.note.sourceId, controlAtAllocation: voice.getEnvelopeControlState(), starts, stops: [], plans: [], controlStates: [], nativeControlStates: [], completion: null, destruction: null }
+      Object.defineProperty(record, 'voice', { value: voice })
+      trace.created.set(voice.instanceId, record)
+      voice.envelopeControl.port.addEventListener('message', event => record.controlStates.push(structuredClone(event.data)))
+      const postMessage = voice.envelopeControl.port.postMessage.bind(voice.envelopeControl.port)
+      voice.envelopeControl.port.postMessage = (...args) => { if (args[0]?.type === 'plan') record.plans.push({ at: context.currentTime, wall: performance.now(), plan: structuredClone(args[0]) }); return postMessage(...args) }
+      const destroy = voice.destroy.bind(voice)
+      voice.destroy = (...args) => {
+        record.destruction ??= { at: context.currentTime, wall: performance.now(), startsAt: voice.startsAt, gateOpen: voice.gateOpen, control: voice.getEnvelopeControlState() }
+        return destroy(...args)
+      }
+      return result
+    }
+    const noteOff = SynthEngine.prototype.noteOffVoice
+    SynthEngine.prototype.noteOffVoice = function (id, ...args) {
+      const voice = this.voices.findHeld(id), record = voice && trace.created.get(voice.instanceId)
+      if (record) record.stops.push({ at: voice.envelope.context.currentTime, wall: performance.now(), startsAt: voice.startsAt, gateOpen: voice.gateOpen, control: voice.getEnvelopeControlState() })
+      return noteOff.call(this, id, ...args)
     }
     const voiceUrl = performance.getEntriesByType('resource').findLast(item => item.name.includes('/src/audio/SynthVoice.ts'))?.name ?? '/src/audio/SynthVoice.ts'
     const { SynthVoice } = await import(voiceUrl), retrigger = SynthVoice.prototype.retrigger
@@ -45,12 +102,26 @@ try {
     const input = page.getByRole('spinbutton', { name: `${name}, значение`, exact: true }); await input.fill(String(value)); await input.press('Enter')
   }
   await page.getByRole('group', { name: 'Форма волны', exact: true }).getByRole('button', { name: /^Sine/ }).click()
+  await page.evaluate(async () => {
+    const trace = window.__declick, before = performance.now()
+    // Report cold context/module preparation separately. The musical input
+    // patterns below exercise a genuinely running, pre-ready native context.
+    await trace.engine.prepare()
+    trace.preparation = { wallMilliseconds: performance.now() - before, state: trace.engine.getState(), diagnostics: trace.engine.getDiagnostics() }
+  })
   await page.evaluate(() => {
     for (const key of document.querySelectorAll('.piano-key')) { key.setPointerCapture = () => {}; key.hasPointerCapture = () => false }
   })
+}
 
+try {
+  await setupSession()
   for (const [name, expected] of [['midi-staccato', 16], ['pc-legato', 8], ['virtual-staccato', 8], ['midi-repeated', 24], ['mixed-chord', 9]]) {
-    const metrics = await page.evaluate(async name => {
+    let attempt = 0
+    const reportUrl = new URL(`../test-results/declick-ui-${browserName}-${name}-${runId}.json`, import.meta.url)
+    const report = await runPcmSuite(async () => {
+      attempt++
+      const metrics = await page.evaluate(async name => {
       const { createPcmRecorder } = await import('/tests/pcm-recorder.mjs')
       const trace = window.__declick, engine = trace.engine, analysis = engine.getAnalysis(), context = analysis.time.context
       engine.panic(); await new Promise(resolve => setTimeout(resolve, 60))
@@ -94,23 +165,56 @@ try {
       const edgeIndex = differences.indexOf(maxJump) + 1
       const edge = { index: edgeIndex, frame: recording.firstFrame + edgeIndex, time: (recording.firstFrame + edgeIndex) / recording.sampleRate, before: Array.from(samples.slice(Math.max(0, edgeIndex - 18), edgeIndex)), after: Array.from(samples.slice(edgeIndex, edgeIndex + 18)), blockOffset: (recording.firstFrame + edgeIndex) % 128 }
       const peak = samples.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0)
-      return { name, sampleRate: recording.sampleRate, firstFrame: recording.firstFrame, lastFrame: recording.lastFrame, missingFrames: recording.missingFrames, gaps: recording.gaps, samples: samples.length, peak, maxJump, p99, edge, jumpRatio: maxJump / Math.max(p99, 1e-8), requests: trace.inputs.length, created: [...trace.created.values()], retriggers: trace.retriggers, remaining: engine.getVoices().length, held: Number(document.querySelector('output[aria-label="Удерживаемые ноты"]')?.textContent) }
-    }, name)
-    assert.equal(metrics.requests, expected, `${name}: duplicate input generated another request`)
-    assert.equal(metrics.created.length, expected, `${name}: wrong number of actual voices`)
-    assert.equal(metrics.retriggers, 0, `${name}: a physical note unexpectedly retriggered an existing envelope`)
-    assert.equal(metrics.remaining, 0); assert.equal(metrics.held, 0)
-    assert.ok(metrics.created.every(voice => voice.latency >= 0 && voice.latency < 0.032), `${name}: input-to-voice latency ${JSON.stringify(metrics.created)}`)
-    assert.ok(metrics.samples > 2000 && metrics.peak > 0.001)
-    if (!process.env.SOUND_LAB_DECLICK_BASELINE) {
-      if (metrics.missingFrames || !(metrics.maxJump < 0.01 && metrics.jumpRatio < 8)) {
-        const userAgent = await page.evaluate(() => navigator.userAgent)
-        await writeFile(`test-results/declick-ui-${userAgent.includes('Edg/') ? 'edge' : 'chrome'}-failure.json`, JSON.stringify({ metrics, errors, userAgent }, null, 2))
-      }
-      assert.equal(metrics.missingFrames, 0, `${name}: native PCM capture skipped frames ${JSON.stringify(metrics.gaps)}`)
-      assert.ok(metrics.maxJump < 0.01 && metrics.jumpRatio < 8, `${name}: anomalous PCM edge ${JSON.stringify(metrics)}`)
-    }
-    results.push(metrics); console.log(`PASS ${name}`, JSON.stringify({ requests: metrics.requests, voices: metrics.created.length, peak: metrics.peak, maxJump: metrics.maxJump, jumpRatio: metrics.jumpRatio, maxLatencyMs: Math.max(...metrics.created.map(voice => voice.latency)) * 1000 }))
+      return { name, sampleRate: recording.sampleRate, firstFrame: recording.firstFrame, lastFrame: recording.lastFrame, missingFrames: recording.missingFrames, gaps: recording.gaps, samples: samples.length, peak, maxJump, p99, edge, jumpRatio: maxJump / Math.max(p99, 1e-8), preparation: trace.preparation, requests: trace.inputs.length, inputs: trace.inputs, created: [...trace.created.values()], retriggers: trace.retriggers, remaining: engine.getVoices().length, held: Number(document.querySelector('output[aria-label="Удерживаемые ноты"]')?.textContent) }
+      }, name)
+      lastMetrics = metrics
+      const checks = [
+        { description: 'duplicate input creates no additional request', passed: metrics.requests === expected },
+        { description: 'actual voice count matches inputs', passed: metrics.created.length === expected },
+        { description: 'physical notes never retrigger another envelope', passed: metrics.retriggers === 0 },
+        { description: 'all voices finish', passed: metrics.remaining === 0 },
+        { description: 'all held keys release', passed: metrics.held === 0 },
+        { description: 'every input-to-voice latency remains below 32 ms', passed: metrics.created.every(voice => voice.latency >= 0 && voice.latency < 0.032) },
+        { description: 'every warm musical input starts its actual native carrier exactly once', passed: metrics.created.length === expected && metrics.created.every(voice => voice.starts.length === 1) },
+        { description: 'every warm input schedules its actual carrier onset below 32 ms', passed: metrics.created.every(voice => { const input = metrics.inputs.find(input => input.instanceId === voice.instanceId), start = voice.starts[0]; return start && start.scheduledAt >= input.time && start.scheduledAt - input.time < 0.032 }) },
+        { description: 'short musical inputs schedule Release after onset and retire only after latest native rendered zero', passed: metrics.created.every(voice => {
+          const start = voice.starts[0], state = voice.destruction?.control
+          const releases = voice.plans.flatMap(({ plan }) => plan.ramps.filter(ramp => ramp.phase === 'release').map(ramp => ({ revision: plan.revision, ...ramp })))
+          return start && voice.destruction && voice.destruction.at >= start.scheduledAt && voice.stops.length > 0 && releases.length > 0 && releases.every(release => release.start >= start.scheduledAt)
+            && state?.zero && state.connected && !state.destroyed && state.acknowledgedRevision === state.revision
+            && Number.isSafeInteger(state.appliedFrame) && Number.isSafeInteger(state.endFrame) && Number.isSafeInteger(state.zeroFrame) && state.zeroFrame >= Math.max(state.appliedFrame, state.endFrame)
+            && Number.isSafeInteger(state.renderedThroughFrame) && state.renderedThroughFrame >= state.zeroFrame + 127
+            && voice.nativeControlStates.some(packet => packet.slot === state.slot && packet.generation === state.generation && packet.instanceId === state.instanceId && packet.revision === state.revision && packet.appliedFrame === state.appliedFrame && packet.endFrame === state.endFrame && packet.zeroFrame === state.zeroFrame && packet.renderedThroughFrame === state.renderedThroughFrame)
+        }) },
+        { description: 'native PCM contains enough samples and audible signal', passed: metrics.samples > 2000 && metrics.peak > 0.001 },
+        { description: 'browser has no console or page errors', passed: errors.length === 0 },
+      ]
+      const structuralFailures = checks.filter(check => !check.passed)
+      if (!process.env.SOUND_LAB_DECLICK_BASELINE) checks.push(
+        { description: 'native PCM capture contains no missing frames', passed: metrics.missingFrames === 0 },
+        { description: 'PCM edge remains below 0.01 and eight times p99', passed: metrics.maxJump < 0.01 && metrics.jumpRatio < 8 },
+      )
+      const userAgent = await page.evaluate(() => navigator.userAgent)
+      const attemptUrl = new URL(reportUrl.href.replace(/\.json$/, `-attempt${attempt}.json`))
+      const value = { results: [{ name, metrics, checks }], errors: [...errors], userAgent }
+      // Persist before assertions too: structural errors are fatal even if the
+      // native PCM capture has a gap. Only the unusable capture may be retried.
+      await writeFile(attemptUrl, JSON.stringify(value, null, 2))
+      captureAttempts.push({ name, attempt, report: attemptUrl.pathname.split('/').at(-1), missingFrames: metrics.missingFrames })
+      if (metrics.missingFrames > 0) invalidCaptures.push({ name, attempt, missingFrames: metrics.missingFrames, gaps: metrics.gaps })
+      assert.deepEqual(structuralFailures, [], `${name}: input, cleanup or browser assertion failed`)
+      return value
+    }, reportUrl, {
+      beforeRetry: async () => {
+        await session.close(); session = null
+        await setupSession()
+      },
+    })
+    await writeFile(reportUrl, JSON.stringify(report, null, 2))
+    assert.deepEqual(report.failures, [], `${name}: failed native PCM assertions; see ${reportUrl.pathname}`)
+    const selected = report.results[0]
+    const metrics = { ...selected.metrics, captureAttempt: selected.captureAttempt }
+    results.push(metrics); console.log(`PASS ${name}`, JSON.stringify({ requests: metrics.requests, voices: metrics.created.length, peak: metrics.peak, maxJump: metrics.maxJump, jumpRatio: metrics.jumpRatio, maxLatencyMs: Math.max(...metrics.created.map(voice => voice.latency)) * 1000, captureAttempt: metrics.captureAttempt }))
   }
 
   await page.evaluate(async () => {
@@ -125,9 +229,14 @@ try {
     await new Promise(resolve => setTimeout(resolve, 60))
     if (trace.engine.getVoices().length || trace.engine.getState().pendingCount) throw new Error('Cancelled input resurrected after deferred resume')
   })
+  deferredResumeCancellation = true
   console.log('PASS deferred native AudioContext resume cannot resurrect an already released MIDI note')
   assert.deepEqual(errors, [])
   const userAgent = await page.evaluate(() => navigator.userAgent)
-  await writeFile(`test-results/declick-ui-${userAgent.includes('Edg/') ? 'edge' : 'chrome'}${process.env.SOUND_LAB_DECLICK_BASELINE ? '-baseline' : ''}.json`, JSON.stringify({ results, errors, userAgent, deferredResumeCancellation: true }, null, 2))
+  await writeFile(`test-results/declick-ui-${browserName}${process.env.SOUND_LAB_DECLICK_BASELINE ? '-baseline' : ''}.json`, JSON.stringify({ results, errors, userAgent, deferredResumeCancellation, captureAttempts, invalidCaptures }, null, 2))
   console.log(`All ${results.length + 1} SOUND LAB declick input scenarios passed.`)
-} finally { await session.close() }
+} catch (error) {
+  // Never overwrite evidence from an earlier failed run.
+  await writeFile(`test-results/declick-ui-${browserName}-failure-${runId}.json`, JSON.stringify({ results, metrics: lastMetrics, errors, error: String(error), deferredResumeCancellation, captureAttempts, invalidCaptures }, null, 2))
+  throw error
+} finally { await session?.close() }
