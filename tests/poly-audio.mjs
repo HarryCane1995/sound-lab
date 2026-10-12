@@ -30,11 +30,11 @@ try {
       }
       createOscillator() {
         const oscillator = super.createOscillator()
-        const record = { oscillator, ended: false, disconnected: false, destination: null, stoppedVoiceLevels: [] }
+        const record = { oscillator, ended: false, disconnected: false, destination: null, startsAt: Infinity, stoppedVoiceLevels: [] }
         this.oscillators.push(record)
         oscillator.addEventListener('ended', () => { record.ended = true })
         const nativeStart = oscillator.start.bind(oscillator)
-        oscillator.start = (...args) => { this.starts++; nativeStart(...args) }
+        oscillator.start = (...args) => { this.starts++; record.startsAt = args[0] ?? this.currentTime; nativeStart(...args) }
         const nativeConnect = oscillator.connect.bind(oscillator)
         oscillator.connect = (destination, ...args) => { record.destination = destination; return nativeConnect(destination, ...args) }
         const nativeStop = oscillator.stop.bind(oscillator)
@@ -44,7 +44,7 @@ try {
             const envelope = gainOutputs.get(carrier)
             const velocity = gainOutputs.get(envelope)
             if (carrier instanceof GainNode && envelope instanceof GainNode && velocity instanceof GainNode) {
-              record.stoppedVoiceLevels.push(Math.abs(carrier.gain.value * envelope.gain.value * velocity.gain.value))
+              record.stoppedVoiceLevels.push(this.currentTime < record.startsAt ? 0 : Math.abs(carrier.gain.value * envelope.gain.value * velocity.gain.value))
             }
           }
           return nativeStop(...args)
@@ -104,6 +104,10 @@ try {
       return 10 * Math.log10(Math.max(1e-20, power))
     }
     const active = engine => engine.getVoices().filter(voice => !voice.retiring)
+    const settleControl = async engine => {
+      const target = engine.getAudioClock().time + engine.getDiagnostics().controlLeadSeconds
+      while (engine.getAudioClock().time <= target) await sleep(2)
+    }
     const ids = engine => active(engine).filter(voice => voice.gateOpen).map(voice => voice.id).sort()
     const close = async engine => { await engine.dispose(); await sleep(25) }
     try {
@@ -143,11 +147,13 @@ try {
       await sleep(430)
       const beforeRelease = analyse(chord)
       chord.noteOffVoice('A:1:64')
+      const chordGateClosed = !active(chord).find(voice => voice.midi === 64).gateOpen
+      await settleControl(chord)
       const duringRelease = active(chord)
       await sleep(450)
       const afterRelease = analyse(chord)
       check('Releasing E4 leaves C4 and G4 sounding', { duringRelease, after: chord.getState(), beforeLevels: [60, 64, 67].map(midi => component(beforeRelease, frequency(midi))), afterLevels: [60, 64, 67].map(midi => component(afterRelease, frequency(midi))) }, [
-        ['only E4 enters its independent Release', duringRelease.find(voice => voice.midi === 64)?.phase === 'release' && duringRelease.filter(voice => voice.midi !== 64).every(voice => voice.gateOpen)],
+        ['only E4 enters its independent Release', chordGateClosed && duringRelease.find(voice => voice.midi === 64)?.phase === 'release' && duringRelease.filter(voice => voice.midi !== 64).every(voice => voice.gateOpen)],
         ['E4 output decays by at least 40 dB', near(afterRelease, frequency(64)).db < near(beforeRelease, frequency(64)).db - 40],
         ['C4 and G4 output levels remain stable', [60, 67].every(midi => Math.abs(20 * Math.log10(component(afterRelease, frequency(midi)) / component(beforeRelease, frequency(midi)))) < 1)],
         ['C4 and G4 envelopes are not restarted', active(chord).every(voice => voice.instanceId === chordVoices.find(original => original.id === voice.id)?.instanceId && voice.phase === 'sustain')],
@@ -202,10 +208,12 @@ try {
         ['held voices reach the new sustain without retrigger', active(stagger).filter(voice => voice.gateOpen).every(voice => Math.abs(voice.envelope - 0.3) < 0.015)],
       ])
       stagger.releaseVoices({})
+      const staggerGatesClosed = active(stagger).every(voice => !voice.gateOpen)
+      await settleControl(stagger)
       const overlappingRelease = active(stagger)
       await sleep(420)
       check('Multiple Releases overlap and clean themselves up', { during: overlappingRelease, after: stagger.getDiagnostics(), rms: analyse(stagger).rms }, [
-        ['both held notes enter Release simultaneously', overlappingRelease.length >= 2 && overlappingRelease.every(voice => !voice.gateOpen && voice.phase === 'release')],
+        ['both held notes enter Release simultaneously', staggerGatesClosed && overlappingRelease.length >= 2 && overlappingRelease.every(voice => !voice.gateOpen && voice.phase === 'release')],
         ['finished Releases remove carriers and become silent', stagger.getState().voiceCount === 0 && stagger.getDiagnostics().carrierCount === 0 && analyse(stagger).rms < 0.00001],
       ])
       await close(stagger)
@@ -255,10 +263,12 @@ try {
       await bend.noteOnVoice(makeNote(55))
       await sleep(130)
       bend.noteOffVoice('A:1:60')
+      const bendGateClosed = !active(bend).find(voice => voice.midi === 60).gateOpen
       bend.setSourcePitchBend('A', 1, -2)
+      await settleControl(bend)
       check('New notes and Release tails share scoped bend state', { voices: active(bend) }, [
         ['new A channel 1 note inherits stored bend', active(bend).find(voice => voice.midi === 55)?.pitchBend === -2],
-        ['releasing A channel 1 voice updates along with chord', active(bend).find(voice => voice.midi === 60)?.phase === 'release' && active(bend).find(voice => voice.midi === 60)?.pitchBend === -2],
+        ['releasing A channel 1 voice updates along with chord', bendGateClosed && active(bend).find(voice => voice.midi === 60)?.phase === 'release' && active(bend).find(voice => voice.midi === 60)?.pitchBend === -2],
       ])
       bend.setSourcePitchBend('A', 1, 0)
       await sleep(120)
@@ -431,13 +441,17 @@ try {
       analyse(scoped)
       await sleep(120)
       scoped.noteOffVoice('A:1:60')
+      const scopedGateClosed = !active(scoped).find(voice => voice.id === 'A:1:60').gateOpen
+      await settleControl(scoped)
       check('Equal notes from two sources have independent identities', { voices: active(scoped) }, [
-        ['A Note Off releases A without changing B', active(scoped).find(voice => voice.id === 'A:1:60')?.phase === 'release' && active(scoped).find(voice => voice.id === 'B:1:60')?.gateOpen],
+        ['A Note Off releases A without changing B', scopedGateClosed && active(scoped).find(voice => voice.id === 'A:1:60')?.phase === 'release' && active(scoped).find(voice => voice.id === 'B:1:60')?.gateOpen],
       ])
       scoped.releaseVoices({ sourceId: 'A', channel: 2 })
+      const allNotesGateClosed = !active(scoped).find(voice => voice.id === 'A:2:64').gateOpen
+      await settleControl(scoped)
       const allNotesOff = active(scoped)
       check('Scoped All Notes Off uses normal Release', { voices: allNotesOff }, [
-        ['only matching held channel enters Release', allNotesOff.find(voice => voice.id === 'A:2:64')?.phase === 'release' && allNotesOff.find(voice => voice.id === 'B:1:60')?.gateOpen && allNotesOff.find(voice => voice.id === 'pc:67')?.gateOpen],
+        ['only matching held channel enters Release', allNotesGateClosed && allNotesOff.find(voice => voice.id === 'A:2:64')?.phase === 'release' && allNotesOff.find(voice => voice.id === 'B:1:60')?.gateOpen && allNotesOff.find(voice => voice.id === 'pc:67')?.gateOpen],
       ])
       await scoped.noteOnVoice(makeNote(65, { id: 'A:2:65', channel: 2 }))
       scoped.releaseVoices({ sourceId: 'A', channel: 2 }, true)

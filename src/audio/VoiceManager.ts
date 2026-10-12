@@ -20,7 +20,7 @@ export class VoiceManager {
 
   get count(): number { return this.managed.size }
   get retiringCount(): number { return this.retiring.size }
-  get heldCount(): number { return this.held.size }
+  get heldCount(): number { return [...this.held.values()].filter(voice => voice.gateOpen).length }
   get all(): SynthVoice[] { return [...this.managed.values(), ...this.retiring.values()] }
   findHeld(id: string): SynthVoice | undefined { return this.held.get(id) }
 
@@ -28,7 +28,15 @@ export class VoiceManager {
     if (this.managed.size < MAX_VOICES) return true
     // A saturated burst waits for a tail to reach zero. Hard truncation here
     // would introduce a discontinuity even though oscillator counts are bounded.
-    if (this.retiring.size >= MAX_RETIRING_VOICES) return false
+    if (this.retiring.size >= MAX_RETIRING_VOICES) {
+      const future = [...this.managed.values()].find(voice => voice.note.origin === 'sequence' && voice.awaitingStart)
+      if (!future) return false
+      this.managed.delete(future.instanceId)
+      if (this.held.get(future.note.id) === future) this.held.delete(future.note.id)
+      future.destroy()
+      ++this.destroyedCount
+      return true
+    }
     this.steal()
     return true
   }
@@ -47,13 +55,14 @@ export class VoiceManager {
     voice.release(immediate ? 0.025 : undefined)
   }
 
-  releaseScope(scope: VoiceScope, immediate: boolean): void {
+  releaseScope(scope: VoiceScope, immediate: boolean, discardSilentSequences = false): void {
     for (const voice of this.all) {
       if (!voiceMatches(voice.note, scope)) continue
       if (this.held.get(voice.note.id) === voice) this.held.delete(voice.note.id)
+      if (discardSilentSequences && voice.note.origin === 'sequence') { voice.destroy(); continue }
       // All Sound Off also shortens already releasing voices, unlike Notes Off.
       if (immediate) voice.release(0.025, true)
-      else if (voice.gateOpen) voice.release()
+      else if (voice.gateOpen || voice.awaitingStart) voice.release()
     }
   }
 
@@ -89,8 +98,10 @@ export class VoiceManager {
     })[0]
     this.managed.delete(candidate.instanceId)
     if (this.held.get(candidate.note.id) === candidate) this.held.delete(candidate.note.id)
+    const wasAwaitingStart = candidate.awaitingStart
     candidate.retiring = true
     candidate.release(STEAL_FADE_SECONDS, true)
-    this.retiring.set(candidate.instanceId, candidate)
+    if (wasAwaitingStart) ++this.destroyedCount
+    else this.retiring.set(candidate.instanceId, candidate)
   }
 }

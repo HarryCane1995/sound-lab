@@ -1,4 +1,4 @@
-export type VoiceOrigin = 'local' | 'midi' | 'audition'
+export type VoiceOrigin = 'local' | 'midi' | 'audition' | 'sequence'
 export type EnvelopePhase = 'attack' | 'decay' | 'sustain' | 'release' | 'idle'
 
 export interface VoiceNote {

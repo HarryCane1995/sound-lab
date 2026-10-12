@@ -1,7 +1,7 @@
 {
   "name": "sound-lab",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -19,7 +19,14 @@
     "test:additive:audio": "node tests/additive-audio.mjs",
     "test:additive:ui": "node tests/additive-ui.mjs",
     "test:additive": "npm run test:additive:audio && npm run test:additive:ui",
-    "test:all": "npm test && npm run test:ui && npm run test:midi && npm run test:poly && npm run test:additive"
+    "test:declick:audio": "node tests/declick-audio.mjs",
+    "test:declick:ui": "node tests/declick-ui.mjs",
+    "test:declick": "npm run test:declick:audio && npm run test:declick:ui",
+    "test:phrase:core": "node tests/phrase-core.mjs",
+    "test:phrase:audio": "node tests/phrase-audio.mjs",
+    "test:phrase:ui": "node tests/phrase-ui.mjs",
+    "test:phrase": "npm run test:phrase:core && npm run test:phrase:audio && npm run test:phrase:ui",
+    "test:all": "npm test && npm run test:ui && npm run test:midi && npm run test:poly && npm run test:additive && npm run test:declick && npm run test:phrase"
   },
   "dependencies": {
     "react": "^19.2.0",

@@ -20,6 +20,8 @@ import { INITIAL_MIDI_STATE } from './midi/types'
 import type { MidiCallbacks, MidiMessage, MidiState, MidiTargetId } from './midi/types'
 import { MidiLearnButton, MidiLearnProvider } from './midi/MidiLearnContext'
 import { MidiPanel } from './components/MidiPanel'
+import { PhraseRecorder } from './components/PhraseRecorder'
+import { usePhraseRecorder, type PhraseController } from './phrases/usePhraseRecorder'
 import './midi/midi.css'
 
 const midiSource = (id: string) => `midi:${JSON.stringify(id)}`
@@ -38,6 +40,7 @@ export default function App() {
   const [patchStatus, setPatchStatus] = useState(initialHarmonics.error ?? 'Режим и гармоники сохраняются автоматически. Solo и Compare действуют только в этой сессии.')
   const paramsRef = useRef(params)
   const engineRef = useRef<SynthEngine | null>(null)
+  const phraseRef = useRef<PhraseController | null>(null)
   const [audio, setAudio] = useState({ contextState: 'not-started', gateOpen: false, audible: false, auditionGateOpen: false, pendingCount: 0 })
   const [voices, setVoices] = useState<VoiceSnapshot[]>([])
   const voiceDisplayKey = useRef('')
@@ -153,6 +156,7 @@ export default function App() {
   }, [])
 
   const stopAll = useCallback(() => {
+    phraseRef.current?.interrupt()
     held.current.clear(); noteRequests.current.clear(); syncHeld()
     auditionRequested.current = false; auditionPending.current = false
     engineRef.current?.panic()
@@ -164,6 +168,7 @@ export default function App() {
 
   const pressHeldNote = useCallback((note: HeldNote) => {
     if (!held.current.press(note)) return
+    phraseRef.current?.onNoteOn({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId })
     syncHeld(); setError(null)
     if (note.origin === 'midi') setVelocity(note.velocity)
     const engine = engineRef.current
@@ -175,7 +180,7 @@ export default function App() {
       if (engineRef.current === engine) refreshAudio()
     }).catch((reason: unknown) => {
       if (engineRef.current !== engine || noteRequests.current.get(note.id) !== token) return
-      noteRequests.current.delete(note.id); held.current.release(note.id); syncHeld()
+      noteRequests.current.delete(note.id); held.current.release(note.id); phraseRef.current?.onNoteOff(note.id); syncHeld()
       engine.noteOffVoice(note.id, true); audioError(reason); refreshAudio()
     })
     refreshAudio()
@@ -187,6 +192,7 @@ export default function App() {
   }, [pressHeldNote])
 
   const releaseNote = useCallback((id: string) => {
+    phraseRef.current?.onNoteOff(id)
     noteRequests.current.delete(id)
     held.current.release(id); syncHeld()
     engineRef.current?.noteOffVoice(id)
@@ -194,7 +200,7 @@ export default function App() {
   }, [refreshAudio, syncHeld])
 
   const releaseLocalNotes = () => {
-    for (const note of held.current.values) if (note.origin === 'local') noteRequests.current.delete(note.id)
+    for (const note of held.current.values) if (note.origin === 'local') { noteRequests.current.delete(note.id); phraseRef.current?.onNoteOff(note.id) }
     held.current.removeWhere(note => note.origin === 'local'); syncHeld()
     engineRef.current?.releaseVoices({ sourceId: 'pc' }, true)
     engineRef.current?.releaseVoices({ sourceId: 'virtual' }, true)
@@ -265,6 +271,7 @@ export default function App() {
   const beginLearn = (target: MidiTargetId) => { stopAll(); midiRef.current?.beginLearn(target) }
 
   const disconnectSource = (sourceId: string) => {
+    phraseRef.current?.onDisconnect(midiSource(sourceId))
     for (const note of held.current.values) if (note.origin === 'midi' && note.sourceId === sourceId) noteRequests.current.delete(note.id)
     held.current.removeWhere(note => note.origin === 'midi' && note.sourceId === sourceId); syncHeld()
     // Disconnect only this source, including its Release tails and pending resumes.
@@ -279,6 +286,7 @@ export default function App() {
     const channel = message.channel
     if (channel === null) return
     if (message.type === 'cc' && (message.controller === 120 || message.controller === 123)) {
+      phraseRef.current?.onSourceRelease(midiSource(message.sourceId), channel)
       for (const note of held.current.values) if (note.origin === 'midi' && note.sourceId === message.sourceId && note.channel === channel) noteRequests.current.delete(note.id)
       held.current.removeWhere(note => note.origin === 'midi' && note.sourceId === message.sourceId && note.channel === channel); syncHeld()
       engineRef.current?.releaseVoices({ sourceId: midiSource(message.sourceId), channel }, message.controller === 120)
@@ -354,6 +362,9 @@ export default function App() {
     refreshAudio()
   }
   const getAnalysis = useCallback(() => engineRef.current?.getAnalysis() ?? null, [])
+  const phraseController = usePhraseRecorder({ engineRef, paramsRef, applyParams,
+    getHeld: () => held.current.values.map(note => ({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId })) })
+  phraseRef.current = phraseController
   const lfoFilterBypassed = params.lfo.enabled && params.lfo.target === 'filter' && params.filter.bypass
   const activeNotes = heldNotes.map(note => ({ id: note.id, midi: note.midi, sourceName: note.sourceName, channel: note.channel }))
   const activeMidis = [...new Set(heldNotes.map(note => note.midi))]
@@ -368,7 +379,7 @@ export default function App() {
   return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className="app-shell">
     <header className="app-header">
       <a className="brand" href="#main" aria-label="SOUND LAB — к лаборатории"><span className="brand-mark"><svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M4 18h5l4-11 8 22 6-17 3 6h3" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" /></svg></span><span>SOUND <strong>LAB</strong><small>Лаборатория звукового синтеза</small></span></a>
-      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">ЛОКАЛЬНО <span>v0.4</span></span></div>
+      <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span><span className="version-tag">ЛОКАЛЬНО <span>v0.5</span></span></div>
     </header>
 
     <main id="main">
@@ -421,10 +432,11 @@ export default function App() {
         </section></div>
 
         <Piano octave={octave} setOctave={next => { releaseLocalNotes(); setOctave(next) }} activeMidis={activeMidis} activeNotes={activeNotes} heldCount={heldNotes.length} voiceCount={voices.length} frequency={params.frequency} onDown={pressNote} onUp={releaseNote} />
+        <PhraseRecorder controller={phraseController} />
         <div className="status-strip" role="status"><span className="status-marker" />{notice}<span className="escape-tip"><kbd>Esc</kbd> остановить</span></div>
         {error && <div className="error-message" role="alert">{error}</div>}
       </div><LessonPanel onLoad={loadLesson} loadedLesson={loadedLesson} /></div>
     </main>
-    <footer className="app-footer"><span>SOUND LAB <span>0.4</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
+    <footer className="app-footer"><span>SOUND LAB <span>0.5</span> · Пространство для любопытства</span><span>Web Audio + Web MIDI <span>•</span> Всё работает в вашем браузере</span></footer>
   </div></MidiLearnProvider>
 }

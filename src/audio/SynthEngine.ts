@@ -1,5 +1,5 @@
 import { copyParams, type AnalysisNodes, type SynthParams, type Waveform } from '../types'
-import { SynthVoice } from './SynthVoice'
+import { CONTROL_LEAD_FRAMES, SynthVoice } from './SynthVoice'
 import { MAX_RETIRING_VOICES, MAX_VOICES, VoiceManager, voiceMatches } from './VoiceManager'
 import type { VoiceNote, VoiceScope, VoiceSnapshot } from './voiceTypes'
 import { getClassicComparisonGain, getHarmonicCoefficients, getHarmonicScale } from '../harmonics/model'
@@ -25,6 +25,13 @@ interface Graph {
   filterModulation: GainNode
 }
 interface NoteRequest { token: number; note: VoiceNote }
+export interface AudioClock { time: number; state: string; sampleRate: number }
+interface ScheduledRequest { request: NoteRequest; startAt: number; endAt: number }
+interface MetronomeTick {
+  oscillator: OscillatorNode; gain: GainNode; sourceId: string;
+  start: number; end: number; peak: number; cancelledAt: number | null; cancelledFrom: number;
+}
+const METRONOME_LIMIT = 8
 
 function bounded(value: number, min: number, max: number, fallback: number): number {
   return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback
@@ -61,6 +68,10 @@ export class SynthEngine {
   // Intents survive voice stealing until the corresponding physical Note Off.
   private intents = new Map<string, NoteRequest>()
   private pending = new Map<string, NoteRequest>()
+  private scheduled = new Map<string, ScheduledRequest>()
+  private metronome = new Set<MetronomeTick>()
+  private contextListeners = new Set<(state: string) => void>()
+  private cancellationListeners = new Set<() => void>()
   private sourceBends = new Map<string, { sourceId: string; channel: number; value: number }>()
   private requestToken = 0
   private instanceId = 0
@@ -107,6 +118,98 @@ export class SynthEngine {
     if (!this.context) this.initialize()
     try { await this.resumeContext(this.context!) }
     catch (error) { if (!this.disposed) throw error }
+  }
+
+  getAudioClock(): AudioClock | null {
+    const context = this.context
+    return context && !this.disposed
+      ? { time: context.currentTime, state: context.state, sampleRate: context.sampleRate } : null
+  }
+
+  subscribeContextState(listener: (state: string) => void): () => void {
+    this.contextListeners.add(listener)
+    return () => { this.contextListeners.delete(listener) }
+  }
+
+  /** Panic invalidates transport promises and timers as well as audio nodes. */
+  subscribeCancellation(listener: () => void): () => void {
+    this.cancellationListeners.add(listener)
+    return () => { this.cancellationListeners.delete(listener) }
+  }
+
+  /** Native ON and Off automation. False lets the lookahead scheduler retry. */
+  scheduleNote(note: VoiceNote, startAt: number, endAt: number): boolean {
+    const context = this.context
+    if (this.disposed || !context || !this.graph || context.state !== 'running'
+      || !Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) return false
+    if (this.intents.has(note.id)) return true
+    const velocity = bounded(note.velocity, 0, 127, 127)
+    if (velocity === 0) return true
+    const now = context.currentTime
+    this.maintain(now)
+    // Reserving a free slot ahead of time is silent. With a full chord, wait
+    // until its actual deadline before shortening an audible note for stealing.
+    if (this.voices.count >= MAX_VOICES && startAt > now + 0.005) return false
+    if (!this.voices.makeRoom()) return false
+    const actualStart = Math.max(now, startAt)
+    const actualEnd = actualStart + (endAt - startAt)
+    const request: NoteRequest = {
+      token: ++this.requestToken,
+      note: { ...note, velocity, frequency: bounded(note.frequency, MIN_FREQUENCY, 20000, this.params.frequency) },
+    }
+    const voice = new SynthVoice(context, this.graph.input, this.graph.pitchModulation,
+      request.note, this.params, ++this.instanceId, 0, { startAt: actualStart, endAt: actualEnd })
+    this.intents.set(note.id, request)
+    this.scheduled.set(note.id, { request, startAt: voice.startsAt, endAt: voice.plannedEndAt ?? actualEnd })
+    this.voices.add(voice)
+    this.lastVelocity = velocity
+    this.scheduleMaintenance()
+    return true
+  }
+
+  /** A small independently cancellable tick pool on the existing context. */
+  scheduleMetronome(when: number, accent: boolean, sourceId = 'metronome'): void {
+    const context = this.context
+    if (this.disposed || !context || !this.graph || context.state !== 'running' || !Number.isFinite(when)) return
+    this.maintain(context.currentTime)
+    if (this.metronome.size >= METRONOME_LIMIT) return
+    const start = Math.max(when, context.currentTime)
+    const oscillator = context.createOscillator()
+    const gain = context.createGain()
+    const peak = accent ? 0.08 : 0.055
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(accent ? 1250 : 900, start)
+    gain.gain.setValueAtTime(0, context.currentTime)
+    gain.gain.setValueAtTime(0, start)
+    gain.gain.linearRampToValueAtTime(peak, start + 0.003)
+    gain.gain.linearRampToValueAtTime(0, start + 0.045)
+    oscillator.connect(gain)
+    gain.connect(this.graph.amplitude)
+    const tick: MetronomeTick = { oscillator, gain, sourceId, start, end: start + 0.05, peak, cancelledAt: null, cancelledFrom: 0 }
+    this.metronome.add(tick)
+    oscillator.start(start)
+    oscillator.stop(tick.end)
+    this.scheduleMaintenance()
+  }
+
+  cancelMetronome(sourceId?: string): void {
+    const now = this.context?.currentTime ?? 0
+    for (const tick of this.metronome) {
+      if (sourceId !== undefined && tick.sourceId !== sourceId) continue
+      if (now <= tick.start || this.context?.state !== 'running') { this.destroyTick(tick); continue }
+      if (tick.cancelledAt !== null || now >= tick.end) continue
+      const value = now < tick.start + 0.003
+        ? tick.peak * (now - tick.start) / 0.003
+        : tick.peak * Math.max(0, 1 - (now - tick.start - 0.003) / 0.042)
+      tick.gain.gain.cancelAndHoldAtTime(now)
+      tick.gain.gain.setValueAtTime(value, now)
+      tick.gain.gain.linearRampToValueAtTime(0, now + 0.008)
+      tick.cancelledAt = now
+      tick.cancelledFrom = value
+      tick.end = now + 0.01
+      tick.oscillator.stop(tick.end)
+    }
+    this.scheduleMaintenance()
   }
 
   /** Legacy manual Play API. Its audition is isolated from all keyboard notes. */
@@ -188,7 +291,9 @@ export class SynthEngine {
     if (this.disposed) return
     this.intents.delete(id)
     this.pending.delete(id)
+    this.scheduled.delete(id)
     this.voices.release(id, immediate)
+    if (this.context) this.maintain(this.context.currentTime)
     this.wakeCapacity()
     this.scheduleMaintenance()
   }
@@ -199,8 +304,10 @@ export class SynthEngine {
       if (!voiceMatches(request.note, scope)) continue
       this.intents.delete(id)
       this.pending.delete(id)
+      this.scheduled.delete(id)
     }
-    this.voices.releaseScope(scope, immediate)
+    this.voices.releaseScope(scope, immediate, this.context?.state !== 'running')
+    if (this.context) this.maintain(this.context.currentTime)
     this.wakeCapacity()
     this.scheduleMaintenance()
   }
@@ -233,12 +340,21 @@ export class SynthEngine {
   /** Cancels pending starts and smoothly shortens every held/releasing voice. */
   panic(): void {
     if (this.disposed) return
+    for (const listener of this.cancellationListeners) listener()
     this.intents.clear()
     this.pending.clear()
+    this.scheduled.clear()
     this.sourceBends.clear()
     this.auditionPitchBend = 0
-    if (this.context) for (const voice of this.voices.all) voice.setPitchBend(0, this.context.currentTime)
-    this.voices.releaseScope({}, true)
+    if (this.context?.state === 'running') {
+      for (const voice of this.voices.all) voice.setPitchBend(0, this.context.currentTime)
+      this.voices.releaseScope({}, true)
+    } else {
+      this.voices.destroyAll()
+      this.resetProcessingState()
+    }
+    this.cancelMetronome()
+    if (this.context) this.maintain(this.context.currentTime)
     this.wakeCapacity()
     this.scheduleMaintenance()
   }
@@ -266,7 +382,7 @@ export class SynthEngine {
       audible: !this.disposed && context?.state === 'running' && snapshots.some(voice => voice.phase !== 'idle'),
       voiceCount: this.voices.count,
       heldCount: this.voices.heldCount,
-      pendingCount: this.pending.size,
+      pendingCount: this.pending.size + [...this.scheduled.values()].filter(note => note.startAt > (context?.currentTime ?? 0)).length,
       auditionGateOpen: snapshots.some(voice => voice.origin === 'audition' && voice.gateOpen),
     }
   }
@@ -297,7 +413,12 @@ export class SynthEngine {
       periodicWaveCacheLimit: PERIODIC_WAVE_CACHE_LIMIT,
       voices: snapshots, voiceCount: this.voices.count, managedCount: this.voices.count,
       retiringCount: this.voices.retiringCount, pendingCount: this.pending.size,
+      scheduledNoteCount: this.scheduled.size,
+      scheduledFutureCount: [...this.scheduled.values()].filter(note => note.startAt > (this.context?.currentTime ?? 0)).length,
+      metronomeCount: this.metronome.size, maxMetronomeTicks: METRONOME_LIMIT,
       maxVoices: MAX_VOICES, maxRetiringVoices: MAX_RETIRING_VOICES,
+      controlLeadFrames: CONTROL_LEAD_FRAMES,
+      controlLeadSeconds: CONTROL_LEAD_FRAMES / (this.context?.sampleRate ?? 48000),
       mixHeadroom: MIX_HEADROOM,
       createdVoiceCount: this.voices.createdCount, destroyedVoiceCount: this.voices.destroyedCount,
     }
@@ -306,18 +427,36 @@ export class SynthEngine {
   async dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
     this.disposed = true
+    for (const listener of this.cancellationListeners) listener()
+    this.cancellationListeners.clear()
     this.intents.clear()
     this.pending.clear()
+    this.scheduled.clear()
     this.sourceBends.clear()
     this.clearMaintenance()
     this.wakeCapacity()
     const context = this.context
-    if (!context) return
+    if (!context) {
+      this.emitContextState('closed')
+      this.contextListeners.clear()
+      return
+    }
     this.voices.releaseScope({}, true)
+    this.cancelMetronome()
     this.disposePromise = (async () => {
-      if (context.state === 'running') await new Promise<void>(resolve => setTimeout(resolve, 30))
+      // Audio time can lag wall time or stop during suspension. Let the forced
+      // Release reach zero before destroying a running graph, with a bounded
+      // escape if the browser has stopped advancing its audio clock.
+      const cleanupAt = context.currentTime + CONTROL_LEAD_FRAMES / context.sampleRate + 0.025 + 0.005
+      const wallDeadline = performance.now() + 250
+      while (context.state === 'running' && context.currentTime < cleanupAt && performance.now() < wallDeadline) {
+        await new Promise<void>(resolve => setTimeout(resolve, Math.min(10, Math.max(1, (cleanupAt - context.currentTime) * 1000))))
+      }
       context.removeEventListener('statechange', this.onContextStateChange)
       this.voices.destroyAll()
+      for (const tick of this.metronome) this.destroyTick(tick)
+      this.emitContextState('closed')
+      this.contextListeners.clear()
       this.waveBuildCount = this.waveCache?.buildCount ?? this.waveBuildCount
       clearPeriodicWaveCache(context)
       this.waveCache = null
@@ -403,6 +542,42 @@ export class SynthEngine {
     param.setTargetAtTime(value, now, 0.008)
   }
 
+  /** A suspended graph retains IIR and lookahead samples even after its voices
+   * are removed. Panic must discard those samples before a later resume. */
+  private resetProcessingState(): void {
+    const context = this.context, graph = this.graph
+    if (!context || !graph || context.state === 'closed') return
+    const filter = context.createBiquadFilter()
+    filter.type = 'lowpass'
+    filter.frequency.value = Math.min(this.params.filter.cutoff, context.sampleRate * 0.49)
+    filter.Q.value = 20 * Math.log10(this.params.filter.q)
+    const compressor = context.createDynamicsCompressor()
+    compressor.threshold.value = graph.compressor.threshold.value
+    compressor.knee.value = graph.compressor.knee.value
+    compressor.ratio.value = graph.compressor.ratio.value
+    compressor.attack.value = graph.compressor.attack.value
+    compressor.release.value = graph.compressor.release.value
+    const limiter = context.createWaveShaper()
+    limiter.curve = graph.limiter.curve
+    limiter.oversample = graph.limiter.oversample
+
+    graph.input.disconnect(graph.filter)
+    graph.filterModulation.disconnect(graph.filter.detune)
+    graph.filter.disconnect()
+    graph.amplitude.disconnect(graph.compressor)
+    graph.compressor.disconnect()
+    graph.master.disconnect(graph.limiter)
+    graph.limiter.disconnect()
+    graph.filter = filter; graph.compressor = compressor; graph.limiter = limiter
+    graph.input.connect(filter)
+    graph.filterModulation.connect(filter.detune)
+    filter.connect(graph.wet)
+    graph.amplitude.connect(compressor)
+    compressor.connect(graph.master)
+    graph.master.connect(limiter)
+    limiter.connect(graph.time)
+  }
+
   private async resumeContext(context: AudioContext): Promise<void> {
     if (context.state === 'running' || context.state === 'closed') return
     const resume = this.resumePromise ?? context.resume()
@@ -414,6 +589,12 @@ export class SynthEngine {
   private maintain(now: number): void {
     const before = this.voices.count + this.voices.retiringCount
     this.voices.maintain(now)
+    for (const [id, scheduled] of this.scheduled) {
+      if (now < scheduled.endAt) continue
+      if (this.intents.get(id) === scheduled.request) this.intents.delete(id)
+      this.scheduled.delete(id)
+    }
+    for (const tick of this.metronome) if (now >= tick.end) this.destroyTick(tick)
     if (before > this.voices.count + this.voices.retiringCount) this.wakeCapacity()
   }
 
@@ -441,7 +622,9 @@ export class SynthEngine {
   private scheduleMaintenance(): void {
     this.clearMaintenance()
     if (this.disposed || this.context?.state !== 'running') return
-    const at = this.voices.nextMaintenanceAt()
+    const at = Math.min(this.voices.nextMaintenanceAt(),
+      ...[...this.scheduled.values()].map(note => note.endAt),
+      ...[...this.metronome].map(tick => tick.end))
     if (!Number.isFinite(at)) return
     const wait = Math.max(1, (at - this.context.currentTime) * 1000 + 2)
     this.maintenanceTimer = setTimeout(() => {
@@ -462,6 +645,21 @@ export class SynthEngine {
     if (this.context?.state === 'running') {
       this.maintain(this.context.currentTime)
       this.scheduleMaintenance()
-    } else this.clearMaintenance()
+    } else {
+      this.clearMaintenance()
+      this.cancelMetronome()
+    }
+    this.emitContextState(this.context?.state ?? 'closed')
+  }
+
+  private emitContextState(state: string): void {
+    for (const listener of this.contextListeners) listener(state)
+  }
+
+  private destroyTick(tick: MetronomeTick): void {
+    try { tick.oscillator.stop() } catch { /* Already stopped or cancelled. */ }
+    tick.oscillator.disconnect()
+    tick.gain.disconnect()
+    this.metronome.delete(tick)
   }
 }

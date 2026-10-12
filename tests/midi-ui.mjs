@@ -184,6 +184,7 @@ try {
   assert.match(await bindingRow('Cutoff · Частота среза').innerText(), /CC 74.*канал 1[\s\S]*Generic USB Keyboard/)
   await send([0xb0, 74, 0])
   await waitValue('Частота среза', 20)
+  await page.getByLabel('Cutoff · Частота среза: управление MIDI', { exact: true }).waitFor({ state: 'visible' })
   assert.equal(await page.getByLabel('Cutoff · Частота среза: управление MIDI', { exact: true }).isVisible(), true)
   await send([0xb0, 74, 127])
   await waitValue('Частота среза', 20000, 1)
