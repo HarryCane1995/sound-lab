@@ -126,6 +126,12 @@ try {
 
   await page.getByRole('button', { name: 'Включить тон Play', exact: true }).click(); await waitVoices(3)
   await setNumber('Частота', 440)
+  // The native frequency ramp lasts 25ms. Fast CI UI actions can complete
+  // before audio reaches its endpoint; wait on the actual parameter value.
+  await page.waitForFunction(() => {
+    const context = window.__polyAudio.contexts.findLast(item => item.state !== 'closed')
+    return window.__polyAudio.oscillators.some(node => node.context === context && !node.__ended && Math.abs(node.frequency.value - 440) < 0.1)
+  }, null, { polling: 10 })
   assert.ok((await carriers()).some(node => Math.abs(node.frequency - 440) < 0.1))
   assert.ok((await carriers()).some(node => Math.abs(node.frequency - 329.6276) < 0.1), 'Manual frequency must not retune held E4')
   await page.getByRole('button', { name: 'Остановить тон Play', exact: true }).click(); await waitVoices(2); await waitHeld(2)
