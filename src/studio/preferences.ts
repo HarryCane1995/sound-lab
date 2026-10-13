@@ -1,10 +1,10 @@
-export type WorkspaceMode = 'studio' | 'learn'
+export type WorkspaceMode = 'studio' | 'forge' | 'learn'
 export type StudioDensity = 'compact' | 'comfortable'
 export const WORKSPACE_KEY = 'sound-lab.workspace.v1'
 const DISPLAY_KEY = 'sound-lab.display.v1'
 
 export function readWorkspace(): WorkspaceMode {
-  try { return localStorage.getItem(WORKSPACE_KEY) === 'learn' ? 'learn' : 'studio' }
+  try { const saved = localStorage.getItem(WORKSPACE_KEY); return saved === 'learn' || saved === 'forge' ? saved : 'studio' }
   catch { return 'studio' }
 }
 

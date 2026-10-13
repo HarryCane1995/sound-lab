@@ -185,6 +185,137 @@ async function offlineGpu(page) {
   return { waveform, spectrum }
 }
 
+// Read only native production IndexedDB; no development modules or controller
+// shortcuts. SHA-256 covers every stored PCM/WAV byte across a real SW update.
+async function readForgeSnapshot(page) {
+  return page.evaluate(async () => {
+    const stored = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('sound-lab.sample-forge.v1', 1)
+      request.onerror = () => reject(request.error)
+      request.onsuccess = () => {
+        const db = request.result, tx = db.transaction(['banks', 'metadata', 'draft'], 'readonly')
+        const banks = tx.objectStore('banks').getAll(), metadata = tx.objectStore('metadata').getAll(), draft = tx.objectStore('draft').get('base')
+        tx.oncomplete = () => { resolve({ banks: banks.result, metadata: metadata.result, draft: draft.result ?? null }); db.close() }
+        tx.onabort = () => { reject(tx.error); db.close() }
+      }
+    })
+    const hash = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(value => value.toString(16).padStart(2, '0')).join('')
+    const sample = async value => ({ ...value, render: { ...value.render, pcm: undefined, wav: undefined,
+      pcmFrames: value.render.pcm.length, pcmSha256: await hash(value.render.pcm), wavBytes: value.render.wav.length, wavSha256: await hash(value.render.wav) } })
+    return { banks: await Promise.all(stored.banks.sort((a, b) => a.id.localeCompare(b.id)).map(async bank => ({ ...bank,
+      base: await sample(bank.base), samples: await Promise.all(bank.samples.map(sample)), copies: await Promise.all(bank.copies.map(sample)) }))),
+    metadata: stored.metadata.sort((a, b) => a.id.localeCompare(b.id)), draft: stored.draft ? await sample(stored.draft) : null }
+  })
+}
+
+function inspectForgeZip(bytes, savedBank) {
+  // Independent standard ZIP local-record reader and bitwise CRC32. The data
+  // suite separately exercises Python zipfile/wave; here the actual offline UI
+  // download must contain byte-identical saved WAVs and their editable patches.
+  const files = new Map()
+  let cursor = 0
+  const crc32 = data => {
+    let value = 0xffffffff
+    for (const byte of data) { value ^= byte; for (let bit = 0; bit < 8; ++bit) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0) }
+    return (value ^ 0xffffffff) >>> 0
+  }
+  while (cursor + 30 <= bytes.length && bytes.readUInt32LE(cursor) === 0x04034b50) {
+    const flags = bytes.readUInt16LE(cursor + 6), method = bytes.readUInt16LE(cursor + 8), checksum = bytes.readUInt32LE(cursor + 14)
+    const packed = bytes.readUInt32LE(cursor + 18), unpacked = bytes.readUInt32LE(cursor + 22), nameBytes = bytes.readUInt16LE(cursor + 26), extraBytes = bytes.readUInt16LE(cursor + 28)
+    assert.equal(method, 0); assert.equal(flags, 0x800); assert.equal(packed, unpacked)
+    const name = bytes.toString('utf8', cursor + 30, cursor + 30 + nameBytes), from = cursor + 30 + nameBytes + extraBytes
+    assert.ok(from + packed <= bytes.length); assert.ok(!files.has(name)); assert.ok(!name.startsWith('/') && !name.split('/').includes('..') && !name.includes('\\'))
+    const data = bytes.subarray(from, from + packed)
+    assert.equal(crc32(data), checksum); files.set(name, data); cursor = from + packed
+  }
+  assert.equal(files.size, 34); assert.equal(bytes.readUInt32LE(cursor), 0x02014b50)
+  const eocd = bytes.length - 22
+  assert.equal(bytes.readUInt32LE(eocd), 0x06054b50); assert.equal(bytes.readUInt16LE(eocd + 10), 34); assert.equal(bytes.readUInt32LE(eocd + 16), cursor)
+  const manifestPath = [...files.keys()].find(name => name.endsWith('/manifest.json')), folder = manifestPath.slice(0, -'manifest.json'.length)
+  const manifest = JSON.parse(files.get(manifestPath).toString('utf8'))
+  assert.equal(manifest.format, 'sound-lab.sample-pack'); assert.equal(manifest.version, 1); assert.equal(manifest.soundLabVersion, appVersion)
+  assert.equal(manifest.name, savedBank.name); assert.equal(manifest.bankId, savedBank.id); assert.equal(manifest.generatorVersion, savedBank.generatorVersion)
+  assert.equal(manifest.batchSeed, savedBank.batchSeed); assert.equal(manifest.intensity, 'medium'); assert.equal(manifest.variationCount, 16); assert.equal(manifest.exportedSampleCount, 16)
+  assert.deepEqual(manifest.basePatch, savedBank.base.patch); assert.deepEqual(new Set(manifest.files.map(name => folder + name)), new Set(files.keys()))
+  assert.deepEqual(manifest.wavFormat, { container: 'RIFF/WAVE', encoding: 'signed PCM', bitsPerSample: 24, channels: 1, sampleRate: 48000 })
+  assert.match(files.get(`${folder}README.txt`).toString('utf8'), /ready-to-use audio samples/)
+  for (const item of manifest.samples) {
+    const saved = savedBank.samples.find(sample => sample.id === item.id)
+    assert.ok(saved); assert.equal(item.name, saved.name); assert.deepEqual(item.tags, saved.tags); assert.equal(item.favorite, saved.favorite)
+    assert.equal(item.fingerprint, saved.render.fingerprint); assert.equal(item.frames, saved.render.pcmFrames); assert.equal(item.duration, saved.render.metrics.duration)
+    const wav = files.get(`${folder}${item.wav}`), patch = JSON.parse(files.get(`${folder}${item.patch}`).toString('utf8'))
+    assert.equal(createHash('sha256').update(wav).digest('hex'), saved.render.wavSha256)
+    assert.equal(wav.toString('ascii', 0, 4), 'RIFF'); assert.equal(wav.toString('ascii', 8, 12), 'WAVE'); assert.equal(wav.readUInt32LE(4), wav.length - 8)
+    assert.equal(wav.readUInt16LE(20), 1); assert.equal(wav.readUInt16LE(22), 1); assert.equal(wav.readUInt32LE(24), 48000); assert.equal(wav.readUInt16LE(34), 24)
+    assert.equal(wav.readUInt32LE(40), saved.render.pcmFrames * 3); assert.equal(wav.length, saved.render.wavBytes)
+    assert.equal(patch.format, 'sound-lab.kick-patch'); assert.equal(patch.version, 1); assert.deepEqual(patch.patch, saved.patch); assert.deepEqual(patch.generatedPatch, saved.generatedPatch)
+    assert.equal(patch.name, saved.name); assert.deepEqual(patch.tags, saved.tags)
+  }
+  return { bytes: bytes.length, files: files.size, wav: manifest.samples.length, patches: manifest.samples.length, verifiedSavedWavHashes: manifest.samples.length }
+}
+
+const forge = page => page.getByRole('region', { name: 'Sample Forge', exact: true })
+async function downloadForgeZip(page, savedBank) {
+  const pending = page.waitForEvent('download')
+  await forge(page).getByRole('button', { name: /^Export ZIP/, exact: false }).click()
+  const downloaded = await pending
+  assert.match(downloaded.suggestedFilename(), /^SOUND_LAB_KICK_PACK_[a-zA-Z0-9_-]+\.zip$/)
+  const bytes = await readFile(await downloaded.path())
+  await forge(page).locator('.forge-progress').waitFor({ state: 'hidden' })
+  return inspectForgeZip(bytes, savedBank)
+}
+
+async function playOfflineKick(page, savedBank) {
+  const selected = savedBank.samples[6]
+  await forge(page).getByRole('button', { name: `Выбрать ${selected.name}`, exact: true }).click()
+  const graph = forge(page).getByRole('region', { name: 'Waveform Preview', exact: true }).locator('svg.forge-waveform')
+  assert.equal(await graph.getAttribute('data-pcm-fingerprint'), selected.render.fingerprint)
+  assert.equal(Number(await graph.getAttribute('data-pcm-frames')), selected.render.pcmFrames)
+  assert.ok((await graph.locator('.forge-wave-peaks').getAttribute('d')).length > 1000, 'Main waveform displays actual non-empty PCM profile')
+  assert.ok((await graph.locator('.forge-wave-envelope').getAttribute('d')).length > 1000, 'Actual windowed RMS envelope accompanies PCM')
+  const contexts = await page.evaluate(() => window.__pwaAudio.contexts.length)
+  await forge(page).getByRole('button', { name: '▶ Selected Kick · B', exact: true }).click(); await waitSound(page, true)
+  const audio = await page.evaluate(() => window.__pwaMeasure())
+  assert.equal(audio.state, 'running'); assert.ok(audio.peak > .001 && audio.peak < 1)
+  await forge(page).getByRole('button', { name: '■ Stop Preview', exact: true }).click(); await waitSound(page, false)
+  assert.equal(await page.evaluate(() => window.__pwaAudio.contexts.length), contexts, 'Offline one-shot preview shares the already initialized synth context')
+  return audio
+}
+
+async function createOfflineForgeBank(page) {
+  assert.equal(await page.evaluate(() => navigator.onLine), false)
+  const personalKeys = ['sound-lab.midi.v1', 'sound-lab.harmonics.v1', 'sound-lab.harmonic-patch.v1']
+  const before = await page.evaluate(keys => keys.map(key => localStorage.getItem(key)), personalKeys)
+  await chooseWorkspace(page, 'forge')
+  await forge(page).getByLabel('Generation Seed', { exact: true }).fill('424242')
+  await forge(page).locator('.forge-batch-actions').getByRole('button', { name: 'GENERATE 16 VARIATIONS', exact: true }).click()
+  await page.waitForFunction(() => document.querySelectorAll('.sample-forge .forge-sample-pad').length === 16, null, { timeout: 30000 })
+  await forge(page).locator('.forge-progress').waitFor({ state: 'hidden' })
+  await forge(page).getByRole('button', { name: 'Выбрать Kick_07', exact: true }).click()
+  await forge(page).getByLabel('Название Kick', { exact: true }).fill('Offline Kick_07')
+  await forge(page).getByLabel('Название Kick', { exact: true }).press('Enter')
+  await forge(page).getByLabel('Новый тег Kick', { exact: true }).fill('Offline')
+  await forge(page).getByLabel('Новый тег Kick', { exact: true }).press('Enter')
+  await forge(page).getByRole('button', { name: 'Избранное выбранного Kick', exact: true }).click()
+  await forge(page).getByLabel('Название Sample Bank', { exact: true }).fill('Offline Forge Bank 0.8')
+  await forge(page).getByLabel('Название Sample Bank', { exact: true }).press('Enter')
+  await forge(page).getByRole('button', { name: /^Save Bank/, exact: false }).click()
+  await page.waitForFunction(() => document.querySelector('.sample-forge')?.getAttribute('data-bank-dirty') === 'false' && !document.querySelector('.sample-forge .forge-progress'))
+  const snapshot = await readForgeSnapshot(page)
+  assert.equal(snapshot.banks.length, 1); assert.equal(snapshot.banks[0].samples.length, 16); assert.equal(snapshot.banks[0].copies.length, 0)
+  assert.equal(snapshot.banks[0].batchSeed, 424242); assert.equal(snapshot.banks[0].name, 'Offline Forge Bank 0.8')
+  assert.equal(snapshot.banks[0].samples[6].name, 'Offline Kick_07'); assert.ok(snapshot.banks[0].samples[6].tags.includes('Offline')); assert.equal(snapshot.banks[0].samples[6].favorite, true)
+  assert.ok(snapshot.banks[0].samples.every(sample => sample.render.pcmFrames > 1000 && sample.render.wavBytes > 3000 && sample.render.sampleRate === 48000))
+  pass('Offline production Sample Forge generates sixteen native kicks and atomically saves real PCM/WAV patches, names, tags and favorites', { bankId: snapshot.banks[0].id, samples: 16, seed: 424242 })
+  const audio = await playOfflineKick(page, snapshot.banks[0])
+  assert.deepEqual(await page.evaluate(keys => keys.map(key => localStorage.getItem(key)), personalKeys), before, 'Offline Sample Forge preserves MIDI/Harmonic settings')
+  pass('Offline production Sample Forge renders saved PCM/RMS waveforms and previews native audio through the shared synth context', audio)
+  const exported = await downloadForgeZip(page, snapshot.banks[0])
+  pass('Offline production ZIP download contains sixteen exact saved WAV files, sixteen editable patches, valid CRC32 manifest and README', exported)
+  await chooseWorkspace(page, 'learn')
+  return snapshot
+}
+
 try {
   await mkdir('test-results', { recursive: true })
   const buildA = await prepareFixture('a'), buildB = await prepareFixture('b')
@@ -276,6 +407,7 @@ try {
   assert.equal(await page.getByRole('slider', { name: 'Гармоника H2', exact: true }).inputValue(), '50')
   pass('Real offline cold reload runs the production synthesizer, native Web Audio and preserved additive settings', audioMetrics)
   pass('Offline production Studio loads every GPU resource and renders actual PCM and FFT without a CDN', await offlineGpu(page))
+  const forgeBaseline = await createOfflineForgeBank(page)
 
   await connect(page)
   await transport(page, 'Record phrase').click(); await status(page, 'Запись')
@@ -376,6 +508,25 @@ try {
   await update.waitFor()
   pass('Playback, paused transport and unsaved name edits block updates; Later keeps old code and explicit check restores the offer')
 
+  await chooseWorkspace(page, 'forge')
+  const autoPreviewControl = forge(page).getByRole('checkbox', { name: 'Прослушивать изменения Kick', exact: true })
+  const autoPreviewBefore = await autoPreviewControl.isChecked()
+  await autoPreviewControl.uncheck()
+  await forge(page).getByRole('button', { name: 'Выбрать Kick_01', exact: true }).click()
+  const kickPitchDecay = forge(page).getByRole('spinbutton', { name: 'Kick Pitch Decay, значение', exact: true })
+  await kickPitchDecay.fill('40'); await kickPitchDecay.press('Enter')
+  await page.waitForFunction(() => document.querySelector('.sample-forge')?.getAttribute('data-dirty') === 'true')
+  assert.equal(await update.isDisabled(), true, 'An unsaved Kick patch blocks a waiting native PWA update')
+  await page.waitForFunction(() => document.querySelector('.sample-forge')?.getAttribute('data-render-status') === 'ready')
+  await forge(page).getByRole('button', { name: 'Undo', exact: true }).click()
+  await page.waitForFunction(() => document.querySelector('.sample-forge')?.getAttribute('data-dirty') === 'false' && document.querySelector('.sample-forge')?.getAttribute('data-render-status') === 'ready')
+  await forge(page).getByRole('button', { name: '■ Stop Preview', exact: true }).click(); await waitSound(page, false)
+  if (autoPreviewBefore) await autoPreviewControl.check()
+  await page.waitForFunction(() => ![...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Обновить сейчас')?.disabled)
+  assert.deepEqual(await readForgeSnapshot(page), forgeBaseline, 'Undo releases the update guard without overwriting any committed Kick audio')
+  await chooseWorkspace(page, 'learn')
+  pass('A real unsaved Sample Forge patch blocks native PWA activation; Undo restores its exact original and releases the guard without rewriting saved PCM/WAV')
+
   const beforeRename = { phrases: await readStore(page, 'phrases'), draft: await readStore(page, 'draft') }
   await transport(page, 'Duplicate phrase: Перед обновлением').click()
   const renameCopy = 'Перед обновлением · копия'
@@ -455,7 +606,8 @@ try {
   }
   await page.getByRole('group', { name: 'Цель LFO', exact: true }).getByRole('button', { name: 'Срез Filter Cutoff', exact: true }).click()
 
-  const beforeUpdate = { phrases: await readStore(page, 'phrases'), draft: await readStore(page, 'draft'), local: await localData(page) }
+  const beforeUpdate = { phrases: await readStore(page, 'phrases'), draft: await readStore(page, 'draft'), local: await localData(page), forge: await readForgeSnapshot(page) }
+  assert.deepEqual(beforeUpdate.forge, forgeBaseline, 'Legacy phrase flows must preserve the complete saved Sample Forge bank')
   const cacheSentinels = await page.evaluate(async () => {
     const scope = (await navigator.serviceWorker.ready).scope
     const obsolete = `workbox-precache-v0-${scope}`
@@ -483,6 +635,8 @@ try {
   pass('Confirmed native worker activation loads new production HTML, preserves phrase/draft/MIDI/harmonic data and cleans only obsolete Workbox caches')
   pass('A new hashed production JS payload executes and preserves non-default amplitude, ADSR, filter and LFO values', { from: buildA.asset, to: buildB.asset, retainedParameters })
   pass('Another client never reloads an old open page or destroys its unsaved edit on controllerchange')
+  assert.deepEqual(await readForgeSnapshot(page), beforeUpdate.forge)
+  pass('Confirmed native PWA update preserves every Sample Forge bank patch, generated original, tag, favorite and exact PCM/WAV byte hash', { banks: beforeUpdate.forge.banks.length, wavHashes: beforeUpdate.forge.banks[0].samples.length + 1 })
 
   await second.waitForFunction(async () => {
     const registration = await navigator.serviceWorker.ready
@@ -515,6 +669,14 @@ try {
   assert.deepEqual(await readStore(page, 'phrases'), beforeUpdate.phrases)
   pass('Updated production version and all saved phrases cold-reload offline after activation')
   pass('Updated production Studio cold-reloads its complete WebGL2 module and real audio visualizations offline', await offlineGpu(page))
+  assert.deepEqual(await readForgeSnapshot(page), beforeUpdate.forge)
+  await chooseWorkspace(page, 'forge')
+  await page.waitForFunction(() => document.querySelectorAll('.sample-forge .forge-sample-pad').length === 16)
+  const updatedKickAudio = await playOfflineKick(page, beforeUpdate.forge.banks[0])
+  const updatedKickZip = await downloadForgeZip(page, beforeUpdate.forge.banks[0])
+  assert.deepEqual(await readForgeSnapshot(page), beforeUpdate.forge)
+  await chooseWorkspace(page, 'learn')
+  pass('Updated production Sample Forge cold-reloads offline, restores the editable sixteen-kick bank, plays PCM and exports the same saved WAV/JSON pairs', { audio: updatedKickAudio, zip: updatedKickZip })
 
   await context.setOffline(false)
   for (const scenario of ['unsupported', 'denied', 'empty']) {

@@ -29,6 +29,8 @@ import { StudioSynthControls } from './components/StudioSynthControls'
 import { CompactHarmonics } from './components/CompactHarmonics'
 import { readDisplay, readWorkspace, saveDisplay, WORKSPACE_KEY, type WorkspaceMode, type StudioDensity } from './studio/preferences'
 import './midi/midi.css'
+import { SampleForge } from './sample-forge/SampleForge'
+import { useSampleForge, type SampleForgeController } from './sample-forge/useSampleForge'
 
 const midiSource = (id: string) => `midi:${JSON.stringify(id)}`
 const MIDI_STATUS_LABELS: Record<MidiState['status'], string> = {
@@ -52,8 +54,10 @@ export default function App() {
   const [transportTarget, setTransportTarget] = useState<HTMLDivElement | null>(null)
   const outputMeter = useRef<HTMLMeterElement>(null)
   const updateMeter = useCallback((rms: number | null) => { if (outputMeter.current) { outputMeter.current.hidden = rms === null; outputMeter.current.value = Math.min(1, rms ?? 0); outputMeter.current.title = rms === null ? 'RMS доступен в GPU-режиме' : `Измеренный выход: RMS ${rms.toFixed(4)}` } }, [])
-  const studio = workspaceMode === 'studio'
+  const forgeActive = workspaceMode === 'forge'
+  const studio = workspaceMode !== 'learn'
   const switchWorkspace = (mode: WorkspaceMode) => {
+    if (mode !== 'forge') forgeRef.current?.stopPreview()
     setWorkspaceMode(mode)
     try { localStorage.setItem(WORKSPACE_KEY, mode) } catch { /* Session still works without persistence. */ }
   }
@@ -69,6 +73,7 @@ export default function App() {
   const harmonicCommit = useRef({ pending: false, revision: 0 })
   const engineRef = useRef<SynthEngine | null>(null)
   const phraseRef = useRef<PhraseController | null>(null)
+  const forgeRef = useRef<SampleForgeController | null>(null)
   const [audio, setAudio] = useState({ contextState: 'not-started', gateOpen: false, audible: false, auditionGateOpen: false, pendingCount: 0 })
   const [voices, setVoices] = useState<VoiceSnapshot[]>([])
   const voiceDisplayKey = useRef('')
@@ -203,6 +208,7 @@ export default function App() {
   }, [])
 
   const stopAll = useCallback(() => {
+    forgeRef.current?.stopPreview()
     phraseRef.current?.interrupt()
     held.current.clear(); noteRequests.current.clear(); syncHeld()
     auditionRequested.current = false; auditionPending.current = false
@@ -420,8 +426,12 @@ export default function App() {
   const phraseController = usePhraseRecorder({ engineRef, paramsRef, applyParams,
     getHeld: () => held.current.values.map(note => ({ ...note, sourceId: note.origin === 'midi' ? midiSource(note.sourceId) : note.sourceId })) })
   phraseRef.current = phraseController
+  const forgeController = useSampleForge({ engineRef, active: forgeActive })
+  forgeRef.current = forgeController
   const updateSafety = useRef<() => string | null>(() => null)
   updateSafety.current = () => {
+    const forgeReason = forgeRef.current?.updateBlockReason()
+    if (forgeReason) return forgeReason
     const phrase = phraseRef.current
     if (phrase?.status !== 'stopped' || phrase.preparing) return 'Остановите запись или воспроизведение перед обновлением.'
     if (phrase.dataBusy) return 'Дождитесь завершения сохранения, импорта или экспорта.'
@@ -461,13 +471,13 @@ export default function App() {
       mode: 'classic', waveform: 'sine', additive: { ...copyAdditive(paramsRef.current.additive), compare: false } })
     setNotice('Oscillator: Sine · 220 Hz · 25%. Гармоники, ADSR, фильтр, LFO и MIDI сохранены.')
   }
-  return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className={`app-shell ${studio ? 'studio-shell' : 'learn-shell'} density-${display.density}`} style={{ '--studio-scale': display.scale / 100 } as CSSProperties}>
+  return <MidiLearnProvider value={{ state: midiState, onLearn: beginLearn, onRemove: id => midiRef.current?.removeBinding(id) }}><div className={`app-shell ${studio ? 'studio-shell' : 'learn-shell'} ${forgeActive ? 'forge-shell' : ''} density-${display.density}`} style={{ '--studio-scale': display.scale / 100 } as CSSProperties}>
     <header className="app-header">
       <a className="brand" href="#main" aria-label="SOUND LAB — к лаборатории"><span className="brand-mark"><svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M4 18h5l4-11 8 22 6-17 3 6h3" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" /></svg></span><span>SOUND <strong>LAB</strong><small>Лаборатория звукового синтеза</small></span></a>
       {studio && <><label className="studio-patch"><span>PATCH</span><select aria-label="Звуковой пресет Studio" value={presetId} onChange={event => choosePreset(event.target.value)}><option value="" disabled>Свои настройки</option>{PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label><div className="studio-top-transport" ref={setTransportTarget} /></>}
       <div className="header-right"><span className={`audio-status ${audio.audible ? 'status-live' : ''}`}><i />{studio ? `${voices.filter(voice => !voice.retiring).length}/16 VOICES` : audio.gateOpen ? 'Звук включён' : audio.audible ? 'Затухание · Release' : 'Аудио в ожидании'}</span>
         {studio && <><meter className="studio-output-meter" ref={outputMeter} aria-label="Уровень выхода RMS" min={0} max={1} low={0.01} high={0.7} optimum={0.15} defaultValue={0} title="Измеренный RMS выхода в GPU-режиме" /><button className={`studio-midi-status ${midiActivity ? 'has-activity' : ''}`} data-status={midiState.status} aria-label="MIDI Monitor и привязки" aria-expanded={midiOpen} onClick={() => setMidiOpen(value => !value)} title={`${MIDI_STATUS_LABELS[midiState.status]} · ${midiState.message}`}><i /><span>{midiState.inputs.find(input => input.id === midiState.selectedId)?.name ?? 'MIDI'}</span><small><b>{MIDI_STATUS_LABELS[midiState.status]}</b><span> · VEL {velocity ?? '—'} · BEND {pitchBend.toFixed(1)}</span></small></button></>}
-        <nav className="workspace-mode" aria-label="Рабочее пространство"><button aria-pressed={studio} onClick={() => switchWorkspace('studio')}>Studio</button><button aria-pressed={!studio} onClick={() => switchWorkspace('learn')}>Learn</button></nav>
+        <nav className="workspace-mode" aria-label="Рабочее пространство"><button aria-pressed={workspaceMode === 'studio'} onClick={() => switchWorkspace('studio')}>Studio</button><button aria-pressed={forgeActive} onClick={() => switchWorkspace('forge')}>Sample Forge</button><button aria-pressed={!studio} onClick={() => switchWorkspace('learn')}>Learn</button></nav>
         <details className="studio-settings"><summary>Settings</summary><div><label>Плотность<select aria-label="Плотность интерфейса" value={display.density} onChange={event => changeDisplay(event.target.value as StudioDensity, display.scale)}><option value="compact">Compact</option><option value="comfortable">Comfortable</option></select></label><label>Масштаб · {display.scale}%<input aria-label="Масштаб интерфейса" type="range" min="80" max="110" step="5" value={display.scale} onChange={event => changeDisplay(display.density, Number(event.target.value))} /></label><button onClick={reset}>Сбросить все параметры</button><button onClick={() => { stopAll(); setNotice('Panic: все голоса остановлены.') }}>Panic · Esc</button><p>Размеры панелей и регуляторов адаптируются к окну. Двойной щелчок ручки — точный ввод; Shift — медленнее; ПКМ или M — MIDI Learn.</p><span>SOUND LAB {__APP_VERSION__} · {import.meta.env.DEV ? 'Development' : 'PWA'}</span></div></details>
         {!studio && <span className="version-tag">{import.meta.env.DEV ? 'DEVELOPMENT' : 'PWA'} <span>v{__APP_VERSION__}</span></span>}</div>
     </header>
@@ -481,7 +491,8 @@ export default function App() {
         loadParams(preset.params); setPresetId(preset.id); setLoadedLesson(null); setNotice(preset.description)
       }}><option value="" disabled>Свои настройки</option>{PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select><button className="reset-button" aria-label="Сбросить все параметры" title="Reset — вернуть исходные параметры и остановить звук" onClick={reset}>↺ <span>Сброс</span></button><MidiLearnButton target="reset" /></div></div></div>}
 
-      <div className="workspace"><div className="synth-workspace">
+      <div className="forge-workspace" hidden={!forgeActive}><SampleForge controller={forgeController} /></div>
+      <div className={`workspace ${forgeActive ? 'forge-synth-hidden' : ''}`}><div className="synth-workspace">
         {studio ? <><div className="studio-upper"><GpuVisualLab getAnalysis={getAnalysis} frequency={scopeFrequency} playing={audio.audible} waveform={params.waveform} cutoff={params.filter.cutoff} filterBypassed={params.filter.bypass} onLevel={updateMeter} /><StudioSynthControls params={params} onChange={change} onFrequency={manualFrequency} onMode={selectMode} onClassic={selectClassic} onPlay={togglePlay} playing={audio.auditionGateOpen} onOscillatorReset={resetOscillator} /></div><CompactHarmonics {...harmonicProps} /></> : <SignalVisualizers getAnalysis={getAnalysis} frequency={scopeFrequency} playing={audio.audible} waveform={params.waveform} cutoff={params.filter.cutoff} filterBypassed={params.filter.bypass} />}
         <div className={studio ? 'studio-midi-drawer' : 'learn-midi-holder'} hidden={studio && !midiOpen}>
         {studio && <button className="studio-drawer-close" aria-label="Закрыть MIDI Monitor" onClick={() => setMidiOpen(false)}>Закрыть ×</button>}

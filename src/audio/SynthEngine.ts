@@ -127,6 +127,12 @@ export class SynthEngine {
       ? { time: context.currentTime, state: context.state, sampleRate: context.sampleRate } : null
   }
 
+  /** A one-shot monitor bypasses musical controls but shares final protection. */
+  getSamplePreviewBus(): { context: AudioContext; destination: AudioNode; monitorLevel: number } | null {
+    if (this.disposed || !this.context || !this.graph || this.context.state === 'closed') return null
+    return { context: this.context, destination: this.graph.master, monitorLevel: this.graph.master.gain.value }
+  }
+
   subscribeContextState(listener: (state: string) => void): () => void {
     this.contextListeners.add(listener)
     return () => { this.contextListeners.delete(listener) }

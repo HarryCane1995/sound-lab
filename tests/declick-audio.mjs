@@ -407,9 +407,21 @@ try {
         await sleep(45)
         const panicPcm = await panicRecorder.stop()
         const panicMetrics = ratioError(panicPcm, panicAt, elapsed => 0.7 * Math.max(0, 1 - elapsed / 0.025))
-        check('Panic fades actual held PCM and cleans the entire saturated graph', { ...panicMetrics, diagnostics: stressEngine.getDiagnostics() }, [
+        // Keep the PCM observation/thresholds above unchanged. The existing
+        // 640-frame lead +25ms fade +5ms cleanup guard +2ms timer padding can
+        // place the first maintenance callback just beyond a 45ms wall sleep.
+        // Wait for native time and the engine's own timer; never force maintain.
+        const beforeCleanup = stressEngine.getDiagnostics()
+        const cleanupAt = Math.max(0, ...stressEngine.voices.all.map(voice => voice.nextMaintenanceAt()).filter(Number.isFinite))
+        const cleanupStarted = performance.now(), nativeTimeBefore = context.currentTime
+        const cleanupDeadline = cleanupStarted + 250
+        while ((context.currentTime < cleanupAt || stressEngine.getState().voiceCount > 0
+          || stressEngine.getDiagnostics().envelopeControlCount > 0) && performance.now() < cleanupDeadline) await sleep(2)
+        const cleanupWait = { deadlineMs: 250, elapsedWallMs: performance.now() - cleanupStarted, cleanupAt,
+          nativeTimeBefore, nativeTimeAfter: context.currentTime, before: beforeCleanup, after: stressEngine.getDiagnostics() }
+        check('Panic fades actual held PCM and cleans the entire saturated graph', { ...panicMetrics, cleanupWait, diagnostics: stressEngine.getDiagnostics() }, [
           ['Panic has no envelope discontinuity', panicMetrics.count > 100 && panicMetrics.maximumError < 0.003 && panicMetrics.maximumStep < 0.7 / (0.025 * panicPcm.sampleRate) + 0.000002 && panicMetrics.missingFrames === 0],
-          ['Panic removes pending admissions voices and every carrier and control node', stressEngine.getState().pendingCount === 0 && stressEngine.getState().voiceCount === 0 && stressEngine.getDiagnostics().totalCarrierCount === 0 && stressEngine.getDiagnostics().envelopeControlCount === 0 && stressEngine.getDiagnostics().createdVoiceCount === stressEngine.getDiagnostics().destroyedVoiceCount],
+          ['Panic removes pending admissions voices and every carrier and control node', cleanupWait.elapsedWallMs <= cleanupWait.deadlineMs && cleanupWait.nativeTimeAfter >= cleanupAt && stressEngine.getState().pendingCount === 0 && stressEngine.getState().voiceCount === 0 && stressEngine.getDiagnostics().totalCarrierCount === 0 && stressEngine.getDiagnostics().envelopeControlCount === 0 && stressEngine.getDiagnostics().createdVoiceCount === stressEngine.getDiagnostics().destroyedVoiceCount],
         ])
       } finally { stressRecorder?.close(); await stressEngine.dispose() }
       return { results, failures: results.flatMap(result => result.checks.filter(assertion => !assertion.passed).map(assertion => `${result.name}: ${assertion.description}`)) }

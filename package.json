@@ -1,7 +1,7 @@
 {
   "name": "sound-lab",
   "private": true,
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -26,13 +26,18 @@
     "test:phrase:audio": "node tests/phrase-audio.mjs",
     "test:phrase:ui": "node tests/phrase-ui.mjs",
     "test:phrase": "npm run test:phrase:core && npm run test:phrase:audio && npm run test:phrase:ui",
-    "test:all": "npm test && npm run test:ui && npm run test:midi && npm run test:poly && npm run test:additive && npm run test:declick && npm run test:phrase && npm run test:pwa && npm run test:gpu && npm run test:studio && npm run test:performance",
+    "test:all": "npm test && npm run test:ui && npm run test:midi && npm run test:poly && npm run test:additive && npm run test:declick && npm run test:phrase && npm run test:pwa && npm run test:gpu && npm run test:studio && npm run test:performance && npm run test:sample-forge",
     "typecheck": "tsc -b",
     "test:pwa": "node tests/pwa.mjs",
     "test:gpu:prototype": "node tests/gpu-prototype.mjs",
     "test:gpu": "npm run test:gpu:prototype && node tests/gpu.mjs",
     "test:studio": "node tests/studio-ui.mjs",
-    "test:performance": "node tests/performance.mjs"
+    "test:performance": "node tests/performance.mjs",
+    "test:sample-forge:audio": "node tests/sample-forge-audio.mjs",
+    "test:sample-forge:batch": "node tests/sample-forge-batch.mjs",
+    "test:sample-forge:data": "node tests/sample-forge-data.mjs",
+    "test:sample-forge:ui": "node tests/sample-forge-ui.mjs",
+    "test:sample-forge": "npm run test:sample-forge:audio && npm run test:sample-forge:batch && npm run test:sample-forge:data && npm run test:sample-forge:ui"
   },
   "dependencies": {
     "react": "^19.2.0",

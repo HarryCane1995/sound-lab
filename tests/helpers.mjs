@@ -11,23 +11,25 @@ export const WORKSPACE_KEY = 'sound-lab.workspace.v1'
 // any of their original UI/audio assertions. The script also restores Learn
 // after a legacy scenario clears its own isolated test storage and reloads.
 export async function initializeTestWorkspace(target, workspace = 'learn') {
-  if (!['learn', 'studio'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
+  if (!['learn', 'studio', 'forge'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
   await target.addInitScript(({ key, workspace }) => {
     try {
       const saved = localStorage.getItem(key)
-      if (saved !== 'learn' && saved !== 'studio') localStorage.setItem(key, workspace)
+      if (saved !== 'learn' && saved !== 'studio' && saved !== 'forge') localStorage.setItem(key, workspace)
     } catch { /* Storage-denial scenarios must still be able to mount the app. */ }
   }, { key: WORKSPACE_KEY, workspace })
 }
 
 export async function chooseWorkspace(page, workspace) {
-  if (!['learn', 'studio'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
-  const selected = page.getByRole('button', { name: workspace === 'learn' ? 'Learn' : 'Studio', exact: true })
+  if (!['learn', 'studio', 'forge'].includes(workspace)) throw new Error(`Unknown test workspace: ${workspace}`)
+  const label = workspace === 'learn' ? 'Learn' : workspace === 'forge' ? 'Sample Forge' : 'Studio'
+  const selected = page.getByRole('button', { name: label, exact: true })
   await selected.waitFor()
   if (await selected.getAttribute('aria-pressed') !== 'true') await selected.click()
-  await page.waitForFunction(label => [...document.querySelectorAll('button')].some(button => button.textContent?.trim() === label && button.getAttribute('aria-pressed') === 'true'), workspace === 'learn' ? 'Learn' : 'Studio')
-  const other = page.getByRole('button', { name: workspace === 'learn' ? 'Studio' : 'Learn', exact: true })
-  if (await other.getAttribute('aria-pressed') !== 'false') throw new Error('Workspace controls must expose a mutually exclusive pressed state')
+  await page.waitForFunction(label => [...document.querySelectorAll('button')].some(button => button.textContent?.trim() === label && button.getAttribute('aria-pressed') === 'true'), label)
+  for (const name of ['Studio', 'Learn', 'Sample Forge'].filter(name => name !== label)) {
+    if (await page.getByRole('button', { name, exact: true }).getAttribute('aria-pressed') !== 'false') throw new Error('Workspace controls must expose a mutually exclusive pressed state')
+  }
 }
 
 export function testBrowserExecutable() {

@@ -1,0 +1,6 @@
+export { KickSynth, kickRenderSeconds } from './KickSynth'
+export { renderKick, finalizeKickPcm, getKickRendererDiagnostics, KICK_SAMPLE_RATE, KICK_PEAK_CEILING } from './KickRenderer'
+export type { RenderedKick, KickRenderOptions } from './KickRenderer'
+export { encodeWav24 } from './WavEncoder'
+export { measureKickPcm, spectrumFeatures, amplitudeDbfs } from './features'
+export type { KickAudioMetrics } from './features'

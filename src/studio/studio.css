@@ -11,6 +11,11 @@
 .studio-settings p,.studio-settings>div>span{font-size:11px;line-height:1.6;color:#93aabc}
 .lesson-holder{min-width:0}
 .lesson-holder[hidden],.studio-midi-drawer[hidden]{display:none!important}
+.forge-workspace[hidden]{display:none!important}
+.forge-synth-hidden .synth-workspace>:not(.studio-midi-drawer),.forge-synth-hidden>.lesson-holder{display:none!important}
+.forge-synth-hidden .synth-workspace{display:block!important}
+.forge-synth-hidden{margin:0!important;padding:0!important;gap:0!important}
+@media(max-width:760px){.studio-shell .header-right{flex-wrap:wrap;min-width:0;max-width:100%}.studio-shell .workspace-mode{min-width:0}}
 .studio-shell{max-width:2560px;padding:0 calc(16px * var(--studio-scale));font-size:calc(12px * var(--studio-scale))}
 .studio-shell .app-header{height:62px;gap:14px}
 .studio-shell .brand{font-size:18px;letter-spacing:1px;gap:8px;flex-shrink:0}
